@@ -1,0 +1,4 @@
+/* 自动生成，请勿手改。由 tools/encrypt_data.js 生成 */
+window.XWK_KEYRING = {"v":1,"algo":"AES-256-GCM","kdf":"PBKDF2-SHA256","iter":200000,"keys":{"baixinyinhang":{"salt":"+r8KxEPYlck3P+gv2HQFkw==","iv":"TCz+APDsmWWjg5sN","data":"ZaqnUO8t05kbqfEpo1pWuW5JTuAbES3FpLriGMATuJI593S7aVVuDXeaxtL1W59+"},"gaoyuxi":{"salt":"iRnEufLtoBQHSI8MC8Bo9Q==","iv":"JHNTPzPGGvU7BKme","data":"D8GZeU9cYbQGPXnbQ8iLpFkKoei6Bvu2pXXd02jlzzqpo6T7rcNqpJvtSI2lP/xm"}}};
+window.XWK_ACCOUNTS = [{"user":"baixinyinhang","pass_hash":"c6ec66ddba265f9990c4bd7b6d3ed94615c51cba2fed0a48c7a22644c0921c54","name":"百信银行","role":"admin","can_edit":true,"can_manage":true},{"user":"gaoyuxi","pass_hash":"6d9a27b87cd6282e77d2c958ea0b6f676b4f67b49899655080116afb069a4cda","name":"高宇欣","role":"admin","can_edit":true,"can_manage":true}];
+window.XWK_DATA_FILES = ["data1.enc","data2.enc","data3.enc","data4.enc","data5.enc","data6.enc","data7.enc","data8.enc","data9.enc","deep_dossier.enc"];

@@ -1,0 +1,89 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>小微行业信贷知识库 · 行业与岗位风险看板</title>
+<link rel="stylesheet" href="static/style.css?v=20261010v94">
+</head>
+<body>
+
+<!-- 登录页 -->
+<div id="loginView" class="login-wrap">
+  <div class="login-card">
+    <div class="login-logo">📊</div>
+    <h1>小微行业信贷知识库</h1>
+    <p class="login-sub">行业风控 · 岗位核验 · 城市分析</p>
+    <form id="loginForm" autocomplete="off">
+      <label class="fld">
+        <span>账号</span>
+        <input type="text" id="loginUser" name="username" autocomplete="off" placeholder="请输入账号" required>
+      </label>
+      <label class="fld">
+        <span>密码</span>
+        <input type="password" id="loginPass" name="password" autocomplete="off" placeholder="请输入密码" required>
+      </label>
+      <div id="loginErr" class="login-err"></div>
+      <button type="submit" class="btn-primary btn-block" id="loginBtn">登 录</button>
+    </form>
+    <p class="login-tip">仅限授权人员访问 · 数据仅供参考</p>
+  </div>
+</div>
+
+<!-- 主界面 -->
+<div id="appView" class="app" hidden>
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <span class="brand-ico">📊</span>
+      <span class="brand-txt">信贷知识库</span>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="side-foot">
+      <div id="metaMini" class="meta-mini"></div>
+      <div class="side-update" id="dataUpdate"></div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn only-mobile" id="navToggle" title="菜单">☰</button>
+      <div class="crumb" id="crumb">数据看板</div>
+      <div class="top-right">
+        <div class="userbox">
+          <span class="avatar" id="userAvatar">管</span>
+          <div class="userinfo">
+            <b id="userName">—</b>
+            <small id="userRole">—</small>
+          </div>
+          <div class="usermenu" id="userMenu">
+            <button data-act="logout">退出登录</button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main class="content" id="content"></main>
+  </div>
+</div>
+
+<!-- 弹层 -->
+<div class="modal-mask" id="modalMask" hidden>
+  <div class="modal" id="modalBox">
+    <div class="modal-head"><b id="modalTitle">标题</b><button class="icon-btn" id="modalClose">✕</button></div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-foot" id="modalFoot"></div>
+  </div>
+</div>
+<div class="toast-wrap" id="toastWrap"></div>
+
+<!-- 第三方库 -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+
+<!-- 密钥环：仅含被各账号密码包装后的密钥，不含任何业务数据 -->
+<script src="static/keyring.js?v=20261010v94"></script>
+<script src="static/app.js?v=20261010v95"></script>
+<!-- V9.5：行业深度档案页 + 交叉验证引擎（依赖 app.js，须在其后加载） -->
+<script src="static/deep_page.js?v=20261010v95"></script>
+</body>
+</html>

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>小微行业信贷知识库 · 行业与岗位风险看板</title>
-<link rel="stylesheet" href="static/style.css?v=20261010v94">
+<link rel="stylesheet" href="static/style.css?v=20261015v127">
 </head>
 <body>
 
@@ -81,9 +81,17 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 
 <!-- 密钥环：仅含被各账号密码包装后的密钥，不含任何业务数据 -->
-<script src="static/keyring.js?v=20261010v94"></script>
-<script src="static/app.js?v=20261010v95"></script>
-<!-- V9.5：行业深度档案页 + 交叉验证引擎（依赖 app.js，须在其后加载） -->
-<script src="static/deep_page.js?v=20261010v95"></script>
+<script src="static/keyring.js?v=20261015v127"></script>
+<!-- V10.0：评级与分层「单一事实来源」（须在 app.js 之前） -->
+<script src="static/core_taxonomy.js?v=20261015v127"></script>
+<!-- V10.0：统一行业装配层（把行业主表/模式/岗位/薪资/城市风险/深度档案合并为一份档案） -->
+<script src="static/profile.js?v=20261015v127"></script>
+<!-- V10.0：通用交叉验证引擎（由行业档案自带的钩子配置驱动） -->
+<script src="static/cross_engine.js?v=20261015v127"></script>
+<!-- V12.2：全库字段一致性体检（只读，须在 app.js 之前） -->
+<script src="static/audit.js?v=20261015v127"></script>
+<script src="static/app.js?v=20261015v127"></script>
+<!-- V10.0：行业深度档案页 + 数据勾稽看板（依赖 app.js，须在其后加载） -->
+<script src="static/deep_page.js?v=20261015v127"></script>
 </body>
 </html>

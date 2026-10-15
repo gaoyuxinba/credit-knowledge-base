@@ -160,6 +160,12 @@ a{color:var(--c-brand);text-decoration:none}
 
 .login-err{min-height:20px;color:#dc2626;font-size:12.5px;margin-bottom:6px}
 
+/* 登录进度条：真实反映下载/解密进度，避免"点了没反应"的观感 */
+.login-prog{margin:2px 0 10px}
+.login-prog .lp-bar{height:6px;border-radius:99px;background:#e6ecf5;overflow:hidden}
+.login-prog .lp-bar i{display:block;height:100%;width:0;border-radius:99px;background:linear-gradient(90deg,var(--c-brand),var(--c-brand-2));transition:width .25s ease}
+.login-prog .lp-txt{margin-top:5px;font-size:11.5px;color:#1d4ed8;text-align:center}
+
 .login-tip{text-align:center;color:var(--c-tx-3);font-size:11.5px;margin-top:18px}
 
 .btn-primary{

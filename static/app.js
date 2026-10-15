@@ -1322,8 +1322,31 @@ async function gcmDecrypt(key, iv, dataWithTag, aad) {
   return new Uint8Array(plain);
 }
 
-// 用账号密码解开主密钥，再解密 9 个数据分片并组装 DB
-async function unlockData(user, pass) {
+// 单个分片下载：45s 超时 + 失败自动重试 2 次（网络抖动不必从头再来）
+async function fetchShard(name) {
+  const url = 'static/data/' + name;
+  let lastErr = null;
+  for (let t = 0; t < 3; t++) {
+    let timer = null;
+    try {
+      const ctl = (window.AbortController) ? new AbortController() : null;
+      if (ctl) timer = setTimeout(function () { ctl.abort(); }, 45000);
+      const res = await fetch(url, { cache: 'no-store', signal: ctl ? ctl.signal : undefined });
+      if (timer) clearTimeout(timer);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return new Uint8Array(await res.arrayBuffer());
+    } catch (e) {
+      if (timer) clearTimeout(timer);
+      lastErr = e;
+      if (t < 2) await new Promise(function (r) { setTimeout(r, 800); });
+    }
+  }
+  throw new Error('分片 ' + name + ' 下载失败（' + (lastErr && lastErr.name === 'AbortError' ? '超时45秒' : (lastErr && lastErr.message) || '网络错误') + '）');
+}
+
+// 用账号密码解开主密钥，再解密 11 个数据分片并组装 DB
+// onProgress({stage, done, total, mb}) 用于登录页真实进度条
+async function unlockData(user, pass, onProgress) {
   if (!window.crypto || !window.crypto.subtle) {
     throw new Error('当前环境不支持 Web Crypto，请在 HTTPS 或 localhost 下访问');
   }
@@ -1332,28 +1355,98 @@ async function unlockData(user, pass) {
   const w = KR.keys[user];
   if (!w) throw new Error('该账号未授权访问数据');
 
-  // 1. 密码 -> KEK -> DEK
+  const report = function (stage, done, total, mb) {
+    if (onProgress) { try { onProgress({ stage: stage, done: done, total: total, mb: mb }); } catch (e) {} }
+  };
+
+  // 1. 密码 -> KEK -> DEK（PBKDF2 20万次，实测 ~0.1s）
+  report('key', 0, 1, 0);
   const kek = await deriveKEK(pass, b64ToBytes(w.salt), KR.iter);
   const dekBytes = await gcmDecrypt(kek, b64ToBytes(w.iv), b64ToBytes(w.data), user);
   const dek = await crypto.subtle.importKey('raw', dekBytes, { name: 'AES-GCM' }, false, ['decrypt']);
 
-  // 2. 解密分片
+  // 2. 并发下载分片（并发 4，原实现是串行 await，26MB 全靠单连接排队）
   const files = window.XWK_DATA_FILES || [1,2,3,4,5,6,7,8,9].map(i => 'data' + i + '.enc');
+  const total = files.length;
+  const raw = new Array(total);
+  let got = 0, bytes = 0, cursor = 0;
+  report('download', 0, total, 0);
+  const CONC = Math.min(4, total);
+  async function worker() {
+    while (cursor < total) {
+      const i = cursor++;
+      const buf = await fetchShard(files[i]);
+      raw[i] = buf;
+      bytes += buf.length;
+      got++;
+      report('download', got, total, bytes / 1048576);
+    }
+  }
+  await Promise.all(Array.from({ length: CONC }, worker));
+
+  // 3. 解密 + 解析
   const parts = {};
-  for (let i = 0; i < files.length; i++) {
+  for (let i = 0; i < total; i++) {
     const name = files[i];
     const idx = parseInt(String(name).replace(/\D/g, ''), 10) || (i + 1);
-    const res = await fetch('static/data/' + name, { cache: 'no-store' });
-    if (!res.ok) throw new Error('数据分片 ' + name + ' 加载失败（' + res.status + '）');
-    const buf = new Uint8Array(await res.arrayBuffer());
+    const buf = raw[i];
+    raw[i] = null; // 及时释放密文，降低峰值内存
     const plain = await gcmDecrypt(dek, buf.slice(0, 12), buf.slice(12), 'data' + idx);
     parts[idx] = JSON.parse(new TextDecoder().decode(plain));
+    report('decrypt', i + 1, total, bytes / 1048576);
   }
 
-  // 3. 组装
+  // 4. 组装
+  report('build', total, total, bytes / 1048576);
   buildDBFromParts(parts);
   if (!DB.industries || !DB.industries.length) throw new Error('解密后数据为空，请检查密钥是否匹配');
   return true;
+}
+
+// ------------------------------------------------ 导出组件按需懒加载（原为同步阻塞 CDN）
+// html2canvas / jsPDF 只服务于「图片版PDF导出」，登录与浏览完全不需要。
+// 早期版本放在 index.html 头部同步加载，cdnjs 一旦卡顿/超时（实测曾 20s 超时），
+// 会阻塞 HTML 解析导致 app.js 不执行 → 登录按钮失效 → 点击后表单原生提交。
+const EXPORT_LIBS = [
+  { name: 'html2canvas', test: function () { return typeof window.html2canvas === 'function'; },
+    urls: ['https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',
+           'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js',
+           'https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js'] },
+  { name: 'jspdf', test: function () { return !!(window.jspdf && typeof window.jspdf.jsPDF === 'function'); },
+    urls: ['https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
+           'https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js',
+           'https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js'] }
+];
+let _exportLibsPromise = null;
+function loadScriptWithTimeout(url, ms) {
+  return new Promise(function (resolve, reject) {
+    const s = document.createElement('script');
+    let settled = false;
+    const done = function (ok) { if (!settled) { settled = true; clearTimeout(t); ok ? resolve() : reject(new Error('加载失败')); } };
+    const t = setTimeout(function () { s.onload = s.onerror = null; done(false); }, ms);
+    s.src = url; s.async = true;
+    s.onload = function () { done(true); };
+    s.onerror = function () { done(false); };
+    document.head.appendChild(s);
+  });
+}
+function ensureExportLibs() {
+  if (_exportLibsPromise) return _exportLibsPromise;
+  _exportLibsPromise = (async function () {
+    for (const lib of EXPORT_LIBS) {
+      if (lib.test()) continue;
+      let ok = false;
+      for (const url of lib.urls) {
+        try { await loadScriptWithTimeout(url, 12000); if (lib.test()) { ok = true; break; } } catch (e) {}
+      }
+      if (!ok) { _exportLibsPromise = null; throw new Error('导出组件 ' + lib.name + ' 加载失败（已尝试 3 个 CDN）'); }
+    }
+    return true;
+  })();
+  return _exportLibsPromise;
+}
+function exportLibsReady() {
+  return EXPORT_LIBS.every(function (l) { return l.test(); });
 }
 
 function initApp(acc) {
@@ -1455,29 +1548,59 @@ async function doLogin() {
     return false;
   }
 
-  // ---- 校验通过，解密业务数据（约 10MB，需要数秒）----
+  // ---- 校验通过，解密业务数据（26MB / 11 分片，耗时几乎全在网络下载）----
   const decryptErr = $('#loginErr');
   const decryptBtn = $('#loginBtn');
+  const progBox = $('#loginProg');
+  const progFill = $('#lpFill');
+  const progTxt = $('#lpTxt');
   const btnOldText = decryptBtn ? decryptBtn.textContent : '';
+
+  const resetUI = function () {
+    if (decryptBtn) { decryptBtn.disabled = false; decryptBtn.textContent = btnOldText; }
+    if (progBox) progBox.hidden = true;
+  };
+  const onProgress = function (s) {
+    if (!progBox) return;
+    progBox.hidden = false;
+    // key 5% → download 5~70% → decrypt 70~95% → build 95~100%
+    let ratio = 0;
+    if (s.stage === 'key') ratio = 0.05;
+    else if (s.stage === 'download') ratio = 0.05 + 0.65 * (s.done / Math.max(1, s.total));
+    else if (s.stage === 'decrypt') ratio = 0.70 + 0.25 * (s.done / Math.max(1, s.total));
+    else ratio = 0.98;
+    if (progFill) progFill.style.width = (ratio * 100).toFixed(0) + '%';
+    if (progTxt) {
+      const mb = s.mb ? s.mb.toFixed(1) + ' MB' : '';
+      if (s.stage === 'key') progTxt.textContent = '正在校验口令…';
+      else if (s.stage === 'download') progTxt.textContent = '正在下载数据 ' + s.done + '/' + s.total + '（' + mb + '）';
+      else if (s.stage === 'decrypt') progTxt.textContent = '正在解密 ' + s.done + '/' + s.total;
+      else progTxt.textContent = '正在装配数据…';
+    }
+  };
+
   try {
-    if (decryptErr) { decryptErr.style.color = '#1d4ed8'; decryptErr.textContent = '身份已确认，正在解密数据…'; }
-    if (decryptBtn) { decryptBtn.disabled = true; decryptBtn.textContent = '解密中…'; }
-    await unlockData(u, p);
+    if (decryptErr) { decryptErr.style.color = '#1d4ed8'; decryptErr.textContent = '身份已确认，正在载入数据…'; }
+    if (decryptBtn) { decryptBtn.disabled = true; decryptBtn.textContent = '载入中…'; }
+    await unlockData(u, p, onProgress);
   } catch (err) {
     console.error('[解密失败]', err);
     if (decryptErr) {
       decryptErr.style.color = '';
-      decryptErr.textContent = '数据解密失败：' + (err && err.message ? err.message : String(err));
+      decryptErr.textContent = '数据加载失败：' + (err && err.message ? err.message : String(err)) + '（请检查网络后重试，或改用「文字版PDF」无需等待整库下载）';
     }
-    if (decryptBtn) { decryptBtn.disabled = false; decryptBtn.textContent = btnOldText; }
+    resetUI();
     return false;
   }
   if (decryptErr) { decryptErr.style.color = ''; decryptErr.textContent = ''; }
-  if (decryptBtn) { decryptBtn.disabled = false; decryptBtn.textContent = btnOldText; }
+  resetUI();
 
   try { localStorage.removeItem('xwk_edits_v4'); localStorage.removeItem('xwk_saved_v2'); localStorage.removeItem('xwk_recent_v2'); } catch(e) {}
 
   S.user = acc;
+
+  // 登录后后台预取导出组件（html2canvas/jsPDF），失败静默——不影响浏览，导出时还有兜底提示
+  try { setTimeout(function () { ensureExportLibs().catch(function () {}); }, 1200); } catch (e) {}
 
   // 持久化登录状态（仅session级，关闭浏览器后需重新登录）
   try {
@@ -6186,6 +6309,13 @@ function generatePdfReport(industries, jobs, cities, allJobs, allRisks, opts) {
     pw.document.write(printHtml);
     pw.document.close();
     toast('已打开打印窗口', '在打印对话框中选择「另存为 PDF」即可（文字可选、体积最小）', 'ok');
+    return;
+  }
+
+  // 导出组件按需加载：未就绪时先提示并后台拉取，绝不阻塞登录/浏览
+  if (!exportLibsReady()) {
+    toast('正在准备导出组件', '首次导出需下载渲染组件，请稍候几秒后重试（或先改用「文字版PDF」）', 'ok');
+    ensureExportLibs().catch(function () {});
     return;
   }
 

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>小微行业信贷知识库 · 行业与岗位风险看板</title>
-<link rel="stylesheet" href="static/style.css?v=v150">
+<link rel="stylesheet" href="static/style.css?v=v151">
 </head>
 <body>
 
@@ -14,7 +14,8 @@
     <div class="login-logo">📊</div>
     <h1>小微行业信贷知识库</h1>
     <p class="login-sub">行业风控 · 岗位核验 · 城市分析</p>
-    <form id="loginForm" autocomplete="off">
+    <!-- onsubmit 兜底：万一 app.js 未加载，也绝不让表单原生提交（否则密码会进 URL/历史记录） -->
+    <form id="loginForm" autocomplete="off" onsubmit="return false;">
       <label class="fld">
         <span>账号</span>
         <input type="text" id="loginUser" name="username" autocomplete="off" placeholder="请输入账号" required>
@@ -24,6 +25,10 @@
         <input type="password" id="loginPass" name="password" autocomplete="off" placeholder="请输入密码" required>
       </label>
       <div id="loginErr" class="login-err"></div>
+      <div id="loginProg" class="login-prog" hidden>
+        <div class="lp-bar"><i id="lpFill"></i></div>
+        <div class="lp-txt" id="lpTxt">准备中…</div>
+      </div>
       <button type="submit" class="btn-primary btn-block" id="loginBtn">登 录</button>
     </form>
     <p class="login-tip">仅限授权人员访问 · 数据仅供参考</p>
@@ -76,22 +81,22 @@
 </div>
 <div class="toast-wrap" id="toastWrap"></div>
 
-<!-- 第三方库 -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<!-- 第三方库：仅用于「导出图片版PDF」，改为按需懒加载（见 app.js ensureExportLibs）。
+     早期版本在此处同步阻塞加载 CDN，一旦 cdnjs 卡顿/超时会连带 app.js 无法执行，
+     导致登录按钮失效、点击后表单原生提交把密码带进 URL。已彻底移出首屏关键路径。 -->
 
 <!-- 密钥环：仅含被各账号密码包装后的密钥，不含任何业务数据 -->
-<script src="static/keyring.js?v=v150"></script>
+<script src="static/keyring.js?v=v151"></script>
 <!-- V10.0：评级与分层「单一事实来源」（须在 app.js 之前） -->
-<script src="static/core_taxonomy.js?v=v150"></script>
+<script src="static/core_taxonomy.js?v=v151"></script>
 <!-- V10.0：统一行业装配层（把行业主表/模式/岗位/薪资/城市风险/深度档案合并为一份档案） -->
-<script src="static/profile.js?v=v150"></script>
+<script src="static/profile.js?v=v151"></script>
 <!-- V10.0：通用交叉验证引擎（由行业档案自带的钩子配置驱动） -->
-<script src="static/cross_engine.js?v=v150"></script>
+<script src="static/cross_engine.js?v=v151"></script>
 <!-- V12.2：全库字段一致性体检（只读，须在 app.js 之前） -->
-<script src="static/audit.js?v=v150"></script>
-<script src="static/app.js?v=v150"></script>
+<script src="static/audit.js?v=v151"></script>
+<script src="static/app.js?v=v151"></script>
 <!-- V10.0：行业深度档案页 + 数据勾稽看板（依赖 app.js，须在其后加载） -->
-<script src="static/deep_page.js?v=v150"></script>
+<script src="static/deep_page.js?v=v151"></script>
 </body>
 </html>

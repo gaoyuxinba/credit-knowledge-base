@@ -195,6 +195,33 @@ function fillerDom() {
 }
 function isSharedFiller(f, v) { var d = fillerDom(); return !!d[f] && String(v || '').trim() === d[f]; }
 
+/* ---- V15.0 岗位族 × 城市 薪资系数 ----
+ * 旧逻辑：所有岗位套同一个 city_factors.salary_factor，等于假设"同城所有职业等比缩放"。
+ * 实证反例：西安 服务员 0.74 vs 技术岗 0.58（同为上海=1.0），同城不同族差 16 个百分点。
+ * 新逻辑：岗位先归族（技术/蓝领服务/销售/白领职能），再取该族该城系数；未命中回退原系数。
+ * 注意：city_factors.salary_factor 本身不改（被城市风险分等算法依赖），此处只做只读取用。
+ */
+function jobFamilyOf(jobName) {
+  var pf = DB.position_family;
+  if (!pf || !pf.map) return 'white';
+  return pf.map[jobName] || 'white';
+}
+function citySalaryFactor(cn, jobName) {
+  var cf = DB.city_factors || {};
+  var base = (cf[cn] && cf[cn].salary_factor) ? cf[cn].salary_factor : 1;
+  var ff = DB.city_factors_family;
+  if (!ff || !ff.families || !jobName) return base;
+  var fam = jobFamilyOf(jobName);
+  var v = ff.families[fam] && ff.families[fam][cn];
+  return (typeof v === 'number') ? v : base;
+}
+function cityFactorConfidence(cn, jobName) {
+  var ff = DB.city_factors_family;
+  if (!ff || !ff.confidence || !jobName) return '';
+  var fam = jobFamilyOf(jobName);
+  return (ff.confidence[fam] && ff.confidence[fam][cn]) || '';
+}
+
 /* ---- D2 岗位追问树渲染 ----
  * 三级分支：主问（正面开口）→ 追问（沿动作细节追）→ 侧问兜底（答不上时查客观证据）。
  * 全部内容来自岗位已有字段的结构化重组，不新编内容。
@@ -847,15 +874,8 @@ function getJobTags(job, salaryInfo) {
 
   
 
-  // 增长趋势
-  if (salaryInfo && salaryInfo.trend) {
-    let hasHighGrowth = false;
-    for (const yr in salaryInfo.trend) {
-      const g = salaryInfo.trend[yr].growth_rate;
-      if (g && String(g).includes('10%')) { hasHighGrowth = true; break; }
-    }
-    if (hasHighGrowth) tags.push({ t: '📈 增长快', c: 'tag-green' });
-  }
+  // 真实同比（仅实测来源给出时才显示）
+  if (salaryInfo && typeof salaryInfo.yoy_growth === 'number' && salaryInfo.yoy_growth >= 10) tags.push({ t: '📈 增长快', c: 'tag-green' });
 
   
 
@@ -1905,6 +1925,7 @@ function updateChips() {
       r['行业编号'].toLowerCase().includes(kw) ||
       fuzzyMatch(r['细分行业'], kw) ||
       fuzzyMatch(r['行业大类'], kw) ||
+      fuzzyMatch(r['国标大类'] || '', kw) ||
       fuzzyMatch(r['职业标签串'] || '', kw)
     );
   } else if (activeCat) {
@@ -2090,7 +2111,7 @@ const DASH_TABS = [
   { k: 'ov', t: '概览与档案', ico: '📋', when: c => c.indRecords.length > 0 },
   { k: 'mode', t: '经营模式', ico: '🧩', when: c => c.selectedCodes.length > 0 },
   { k: 'job', t: '岗位与电核', ico: '🎙', when: c => c.selectedCodes.length > 0 },
-  { k: 'salary', t: '薪资趋势', ico: '💰', when: c => c.selectedCodes.length > 0 },
+  { k: 'salary', t: '薪资快照', ico: '💰', when: c => c.selectedCodes.length > 0 },
   { k: 'risk', t: '城市风险', ico: '🏙', when: c => c.selectedCodes.length > 0 || c.selectedCities.length > 0 },
   { k: 'city', t: '城市调研', ico: '🔍', when: c => !!c.p },
   { k: 'xe', t: '交叉验证', ico: '⚖', when: c => !!c.p && (c.p.hooks || []).length > 0 },
@@ -2211,7 +2232,7 @@ function dashIdBox(c) {
 
       <div><div class="k">行业名称</div><div class="v">${esc(ind['细分行业'])}</div></div>
 
-      <div><div class="k">行业大类</div><div class="v">${esc(ind['行业大类'])}</div></div>
+      <div><div class="k">国标分类</div><div class="v">${esc(ind['国标门类'] || ind['行业大类'] || '—')}${ind['国标大类'] ? '<div style="font-size:11px;color:#64748b;font-weight:400;margin-top:2px">GB/T 4754 ' + (ind['国标大类代码'] && ind['国标大类代码'] !== '--' ? esc(ind['国标大类代码']) + ' ' : '') + esc(ind['国标大类']) + '</div>' : ''}</div></div>
 
       <div><div class="k">职业 / 模式 / 城市</div><div class="v">${jobCount} / ${modeCount} / ${allCities.length}</div></div>
 
@@ -2294,7 +2315,7 @@ function renderDashTab(id, c) {
     return sec04(jobRecords, c.selectedJobs) +
       (c.selectedJobs.length ? '' :
         '<p class="hint" style="margin:10px 0 0;font-size:12px;color:#64748b;">💡 上面没选具体职业时，这里列出该行业全部岗位；' +
-        '在上方「职业搜索」里挑 1~3 个岗位，可以再看「薪资趋势」那一页。</p>');
+        '在上方「职业搜索」里挑 1~3 个岗位，可以再看「薪资快照」那一页。</p>');
   }
 
   if (id === 'salary') {
@@ -2920,7 +2941,7 @@ function jumpCityRisk(cityName) {
 }
 
 
-// 06 薪资趋势（支持城市维度 + 购买力）
+// 06 薪资快照（支持城市维度 + 购买力）
 
 function sec06(indCode, jobNames, selectedCities) {
 
@@ -2935,320 +2956,122 @@ function sec06(indCode, jobNames, selectedCities) {
 
 
   const cards = jobNames.map(jn => {
-
-    const key = indCode ? `${indCode}|${jn}` : Object.keys(DB.salary).find(k => k.endsWith('|' + jn));
-
-    const sd = key ? DB.salary[key] : null;
-
-    if (!sd) return '';
-
-
-
-    const trend = sd.trend || {};
-
-    const years = Object.keys(trend).sort();
-
-    if (!years.length) return '';
-
-    // 只跟选中的城市比较，不用所有城市/trend的最大值
-    const allAdj = cities.map(cn => {
-      const f = (cf[cn] && cf[cn].salary_factor) ? cf[cn].salary_factor : 1;
-      const adj = Math.round(sd.monthly_median * f);
-      const costF2 = (cf[cn] && cf[cn].cost_factor) ? cf[cn].cost_factor : 1;
-      const pp = Math.round(adj / costF2);
-      return { adj, pp };
-    });
-    const maxVal = Math.max(...allAdj.map(d => Math.max(d.adj, d.pp))) * 1.1;
-
-
-
-    // 城市薪资对比表
-
-    const cityRows = cities.map(cn => {
-
-      const f = (cf[cn] && cf[cn].salary_factor) ? cf[cn].salary_factor : 1;
-
-      const adj = Math.round(sd.monthly_median * f);
-
-      const adjMin = Math.round(sd.monthly_min * f);
-
-      const adjMax = Math.round(sd.monthly_max * f);
-
-      const costF = (cf[cn] && cf[cn].cost_factor) ? cf[cn].cost_factor : 1;
-
-      const pp = Math.round(adj / costF);
-
-      const ppLevel = pp >= sd.monthly_median * 1.15 ? 'high' : pp <= sd.monthly_median * 0.85 ? 'low' : 'mid';
-
-      return `<tr>
-
-        <td class="city">${esc(cn)}</td>
-
-        <td>${(adjMin/1000).toFixed(1)}k - ${(adjMax/1000).toFixed(1)}k</td>
-
-        <td><b>${(adj/1000).toFixed(1)}k</b></td>
-
-        <td>${(pp/1000).toFixed(1)}k <span class="pp-tag ${ppLevel}">${ppLevel === 'high' ? '↑高于基准' : ppLevel === 'low' ? '↓低于基准' : '≈持平'}</span></td>
-
-        <td>${(adj*12/10000).toFixed(1)}w</td>
-
-      </tr>`;
-
-    }).join('');
-
-
-
-    // 城市对比柱状图
-    const cityBars = cities.map((cn, idx) => {
-      const d = allAdj[idx];
-      const adj = d.adj, pp = d.pp;
-      const h = (adj / maxVal * 100).toFixed(1);
-      const ppH = (pp / maxVal * 100).toFixed(1);
-
-      return `<div class="city-bar-group">
-
-        <div class="city-bar-pair">
-
-          <div class="city-bar" title="${esc(cn)}名义薪资: ${(adj/1000).toFixed(1)}k">
-
-            <div class="bar-fill" style="height:${h}%;background:linear-gradient(180deg,#60a5fa,#2563eb)"></div>
-
-          </div>
-
-          <div class="city-bar" title="${esc(cn)}购买力等值: ${(pp/1000).toFixed(1)}k">
-
-            <div class="bar-fill" style="height:${ppH}%;background:linear-gradient(180deg,#34d399,#059669)"></div>
-
-          </div>
-
-        </div>
-
-        <div class="bar-lbl">${esc(cn)}</div>
-        <div class="bar-lbl-val"><span style="color:#2563eb;">${(adj/1000).toFixed(1)}k</span> / <span style="color:#059669;">${(pp/1000).toFixed(1)}k</span></div>
-
-      </div>`;
-
-    }).join('');
-
-
-
-    // 年度趋势SVG面积渐变图
-
-    const chartW = 500, chartH = 180, padL = 40, padR = 20, padT = 20, padB = 30;
-
-    const innerW = chartW - padL - padR;
-
-    const innerH = chartH - padT - padB;
-
-    const vals = years.map(y => trend[y].monthly_median);
-
-    const vMax = Math.max(...vals) * 1.15;
-
-    const vMin = Math.min(...vals) * 0.85;
-
-    const vRange = vMax - vMin || 1;
-
-    
-
-    const points = years.map((y, i) => {
-
-      const x = padL + (innerW / (years.length - 1 || 1)) * i;
-
-      const yv = padT + innerH - ((trend[y].monthly_median - vMin) / vRange * innerH);
-
-      return { x, y: yv, year: y, val: trend[y].monthly_median };
-
-    });
-
-    
-
-    // 面积路径
-
-    const linePath = points.map((p, i) => (i === 0 ? 'M' : 'L') + p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(' ');
-
-    const areaPath = linePath + ` L${points[points.length-1].x.toFixed(1)},${(padT+innerH).toFixed(1)} L${points[0].x.toFixed(1)},${(padT+innerH).toFixed(1)} Z`;
-
-    
-
-    // 网格线
-
-    const gridLines = [];
-
-    for (let g = 0; g <= 4; g++) {
-
-      const gy = padT + innerH / 4 * g;
-
-      const gv = Math.round(vMax - (vRange / 4 * g));
-
-      gridLines.push(`<line x1="${padL}" y1="${gy.toFixed(1)}" x2="${chartW-padR}" y2="${gy.toFixed(1)}" stroke="#e5e7eb" stroke-dasharray="3,3" stroke-width="0.5"/>`);
-
-      gridLines.push(`<text x="${padL-6}" y="${gy.toFixed(1)}" text-anchor="end" dominant-baseline="middle" fill="#9ca3af" font-size="10">${(gv/1000).toFixed(0)}k</text>`);
-
-    }
-
-    
-
-    // 数据点和标注
-
-    const dataDots = points.map(p => `
-
-      <circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4" fill="#fff" stroke="#3b82f6" stroke-width="2">
-
-        <animate attributeName="r" from="0" to="4" dur="0.5s" fill="freeze" begin="${points.indexOf(p)*0.1}s"/>
-
-      </circle>
-
-      <text x="${p.x.toFixed(1)}" y="${(p.y-10).toFixed(1)}" text-anchor="middle" fill="#1e40af" font-size="11" font-weight="600">${(p.val/1000).toFixed(1)}k</text>
-
-      <text x="${p.x.toFixed(1)}" y="${(padT+innerH+18).toFixed(1)}" text-anchor="middle" fill="#6b7280" font-size="11">${p.year}</text>
-
-    `).join('');
-
-    
-
-    // 渐变定义
-
-    const trendSvg = `
-
-    <svg viewBox="0 0 ${chartW} ${chartH}" class="trend-svg" preserveAspectRatio="xMidYMid meet">
-
-      <defs>
-
-        <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
-
-          <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.35"/>
-
-          <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.02"/>
-
-        </linearGradient>
-
-        <linearGradient id="lineGrad" x1="0" y1="0" x2="1" y2="0">
-
-          <stop offset="0%" stop-color="#60a5fa"/>
-
-          <stop offset="100%" stop-color="#2563eb"/>
-
-        </linearGradient>
-
-      </defs>
-
-      ${gridLines.join('')}
-
-      <path d="${areaPath}" fill="url(#areaGrad)" class="trend-area">
-
-        <animate attributeName="opacity" from="0" to="1" dur="0.8s" fill="freeze"/>
-
-      </path>
-
-      <path d="${linePath}" fill="none" stroke="url(#lineGrad)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="trend-line">
-
-        <animate attributeName="stroke-dasharray" from="0,1000" to="1000,0" dur="1.2s" fill="freeze"/>
-
-      </path>
-
-      ${dataDots}
-
-    </svg>`;
-
-
-
-    const firstYear = trend[years[0]];
-
-    const lastYear = trend[years[years.length - 1]];
-
-    const growth = firstYear && lastYear ? ((lastYear.monthly_median - firstYear.monthly_median) / firstYear.monthly_median * 100).toFixed(1) : 0;
-
-
-
-    const demandTag = sd.demand === '高' ? 'hot' : sd.demand === '中' ? 'warm' : 'cool';
-
-    const demandText = sd.demand === '高' ? '需求旺盛' : sd.demand === '中' ? '需求稳定' : '需求一般';
-
-
-
-    const baseMedian = (sd.monthly_median/1000).toFixed(1);
-
-
-
-    return `<div class="salary-card fade-in">
-
-      <div class="card-hd"><h3><span class="no">06</span>${esc(jn)} · 薪资趋势分析</h3><div class="sub">2019-2025 · 基准薪资 ${baseMedian}k</div></div>
-
-      <div class="salary-grid">
-
-        <div class="salary-stat"><div class="sl">基准月薪</div><div class="sv">${baseMedian}k</div></div>
-
-        <div class="salary-stat"><div class="sl">月薪范围</div><div class="sv">${(sd.monthly_min/1000).toFixed(1)}k<small> - ${(sd.monthly_max/1000).toFixed(1)}k</small></div></div>
-
-        <div class="salary-stat"><div class="sl">年薪中位</div><div class="sv">${(sd.annual_median/10000).toFixed(1)}w</div></div>
-
-        <div class="salary-stat"><div class="sl">7年增长</div><div class="sv">${growth > 0 ? '+' : ''}${growth}%</div><div class="delta ${growth > 0 ? 'up' : 'down'}">${growth > 0 ? '↑' : '↓'} ${Math.abs(growth)}%</div></div>
-
-      </div>
-
-
-
-      ${cities.length > 1 || (cities.length === 1 && cities[0] !== '重庆') ? `
-
-      <div class="salary-city-chart">
-
-        <div class="chart-title">🏙 各城市薪资 vs 购买力对比</div>
-
-        <div class="city-bars-legend">
-
-          <span><i style="background:#2563eb"></i>名义月薪（含城市系数调整）</span>
-
-          <span><i style="background:#059669"></i>购买力等值（扣除生活成本后）</span>
-
-        </div>
-
-        <div class="salary-bars city-mode">${cityBars}</div>
-
-      </div>
-
-      <div class="salary-city-tbl">
-
-        <table class="tbl compact">
-
-          <thead><tr><th>城市</th><th>月薪范围</th><th>月薪中位</th><th>购买力等值</th><th>年薪</th></tr></thead>
-
-          <tbody>${cityRows}</tbody>
-
-        </table>
-
-      </div>` : ''}
-
-
-
-      <div class="salary-chart">
-
-        <div class="chart-title">📈 年度薪资趋势（基准月薪中位数）</div>
-
-        <div class="trend-chart-wrap">${trendSvg}</div>
-
-      </div>
-
-      <div class="salary-demand">
-
-        <span class="dl">市场需求：</span>
-
-        <span class="tag ${demandTag}">${demandText}</span>
-
-        <span class="dl" style="margin-left:12px">年均增长率：</span>
-
-        <span class="tag blue">${esc(sd.growth_rate)}</span>
-
-        <span class="dl" style="margin-left:auto;font-size:11px;color:var(--c-tx-3)">基准薪资基于行业大类模型估算，城市薪资=基准×城市系数，购买力=名义薪资÷城市系数</span>
-
-      </div>
-
-    </div>`;
-
+  const key = indCode ? `${indCode}|${jn}` : Object.keys(DB.salary).find(k => k.endsWith('|' + jn));
+  const sd = key ? DB.salary[key] : null;
+  if (!sd) return '';
+
+  const cf = DB.city_factors || {};
+  const cities = selectedCities && selectedCities.length ? selectedCities : allCities.slice(0, 6);
+
+  // 城市薪资对比（保留：全国中位 × 城市系数）
+  const allAdj = cities.map(cn => {
+    const f = citySalaryFactor(cn, jn);
+    const adj = Math.round(sd.monthly_median * f);
+    const costF2 = (cf[cn] && cf[cn].cost_factor) ? cf[cn].cost_factor : 1;
+    const pp = Math.round(adj / costF2);
+    return { adj, pp };
+  });
+  const maxVal = Math.max(...allAdj.map(d => Math.max(d.adj, d.pp))) * 1.1;
+
+  const cityRows = cities.map((cn, idx) => {
+    const f = citySalaryFactor(cn, jn);
+    const adj = Math.round(sd.monthly_median * f);
+    const adjMin = Math.round(sd.monthly_min * f);
+    const adjMax = Math.round(sd.monthly_max * f);
+    const costF = (cf[cn] && cf[cn].cost_factor) ? cf[cn].cost_factor : 1;
+    const pp = Math.round(adj / costF);
+    const ppLevel = pp >= sd.monthly_median * 1.15 ? 'high' : pp <= sd.monthly_median * 0.85 ? 'low' : 'mid';
+    return `<tr>
+      <td class="city">${esc(cn)}</td>
+      <td>${(adjMin/1000).toFixed(1)}k - ${(adjMax/1000).toFixed(1)}k</td>
+      <td><b>${(adj/1000).toFixed(1)}k</b></td>
+      <td>${(pp/1000).toFixed(1)}k <span class="pp-tag ${ppLevel}">${ppLevel === 'high' ? '↑高于基准' : ppLevel === 'low' ? '↓低于基准' : '≈持平'}</span></td>
+      <td>${(adj*12/10000).toFixed(1)}w</td>
+    </tr>`;
   }).join('');
 
+  const cityBars = cities.map((cn, idx) => {
+    const d = allAdj[idx];
+    const adj = d.adj, pp = d.pp;
+    const h = (adj / maxVal * 100).toFixed(1);
+    const ppH = (pp / maxVal * 100).toFixed(1);
+    return `<div class="city-bar-group">
+      <div class="city-bar-pair">
+        <div class="city-bar" title="${esc(cn)}名义薪资: ${(adj/1000).toFixed(1)}k"><div class="bar-fill" style="height:${h}%;background:linear-gradient(180deg,#60a5fa,#2563eb)"></div></div>
+        <div class="city-bar" title="${esc(cn)}购买力等值: ${(pp/1000).toFixed(1)}k"><div class="bar-fill" style="height:${ppH}%;background:linear-gradient(180deg,#34d399,#059669)"></div></div>
+      </div>
+      <div class="bar-lbl">${esc(cn)}</div>
+      <div class="bar-lbl-val"><span style="color:#2563eb;">${(adj/1000).toFixed(1)}k</span> / <span style="color:#059669;">${(pp/1000).toFixed(1)}k</span></div>
+    </div>`;
+  }).join('');
+
+  // —— 2025 薪酬分布快照 ——
+  const baseMedian = (sd.monthly_median/1000).toFixed(1);
+  const lo = sd.monthly_min || sd.monthly_median, hi = sd.monthly_max || sd.monthly_median;
+  const span = (hi - lo) || 1;
+  const medPct = Math.max(2, Math.min(98, (sd.monthly_median - lo) / span * 100));
+  const conf = sd.confidence || '未核实';
+  const confCls = conf === '高' ? 'c-hi' : conf === '中' ? 'c-mid' : conf === '低' ? 'c-lo' : 'c-unk';
+  const yoy = (typeof sd.yoy_growth === 'number') ? (sd.yoy_growth > 0 ? '+' : '') + sd.yoy_growth + '%' : '—';
+  const annualW = (sd.monthly_median * 12 / 10000).toFixed(1);
+  const distBar = `<div class="salary-dist">
+      <div class="dist-track"><div class="dist-median" style="left:${medPct.toFixed(1)}%"></div></div>
+      <div class="dist-legend"><span>低 ${lo/1000}k</span><span class="med">中位 ${baseMedian}k</span><span>高 ${hi/1000}k</span></div>
+    </div>`;
+
+  // 岗位族与系数置信度（V15.0 分族折算标注）
+  const famKey = jobFamilyOf(jn);
+  const famMeta = (DB.city_factors_family && DB.position_family && DB.position_family._meta &&
+    DB.position_family._meta.families && DB.position_family._meta.families[famKey]) || {};
+  const famName = famMeta.name || '白领职能';
+  const famConfSet = new Set(cities.map(cn => cityFactorConfidence(cn, jn)).filter(Boolean));
+  const famConf = famConfSet.size ? [...famConfSet].join('/') : '';
+
+  const demandTag = sd.demand === '高' ? 'hot' : sd.demand === '中' ? 'warm' : 'cool';
+  const demandText = sd.demand === '高' ? '需求旺盛' : sd.demand === '中' ? '需求稳定' : '需求一般';
+  const confTagCls = conf === '高' ? 'tag-green' : conf === '中' ? 'tag-blue' : conf === '低' ? 'tag-orange' : 'tag-gray';
+
+  return `<div class="salary-card fade-in">
+    <div class="card-hd"><h3><span class="no">06</span>${esc(jn)} · 2025 薪资快照</h3>
+      <div class="sub">基准中位 ${baseMedian}k · <span class="conf-badge ${confCls}">${conf === '未核实' ? '估算·待核实' : conf + '置信'}</span></div></div>
+    <div class="salary-grid">
+      <div class="salary-stat"><div class="sl">基准月薪(中位)</div><div class="sv">${baseMedian}k</div></div>
+      <div class="salary-stat"><div class="sl">月薪范围</div><div class="sv">${(lo/1000).toFixed(1)}k<small> - ${(hi/1000).toFixed(1)}k</small></div></div>
+      <div class="salary-stat"><div class="sl">年薪中位</div><div class="sv">${annualW}w</div></div>
+      <div class="salary-stat"><div class="sl">真实同比</div><div class="sv">${yoy}</div><div class="delta ${ (typeof sd.yoy_growth==='number' && sd.yoy_growth>0)?'up':'down'}">${ (typeof sd.yoy_growth==='number')? ((sd.yoy_growth>0?'↑':'↓')+' '+Math.abs(sd.yoy_growth)+'%') : '无实测来源'}</div></div>
+    </div>
+    ${distBar}
+    <div class="salary-source">📌 来源：${sd.source ? esc(sd.source) : '暂无实测来源（沿用历史估算值，待核实）'}${sd.updated ? ' · ' + esc(sd.updated) : ''}</div>
+
+    ${cities.length > 1 || (cities.length === 1 && cities[0] !== '重庆') ? `
+    <div class="salary-city-chart">
+      <div class="chart-title">🏙 各城市薪资 vs 购买力对比</div>
+      <div class="fam-note">按「${esc(famName)}」系数折算 · 全国中位 × 该族城市系数${famConf ? ' · ' + esc(famConf) : ''}</div>
+      <div class="city-bars-legend">
+        <span><i style="background:#2563eb"></i>名义月薪（含城市系数调整）</span>
+        <span><i style="background:#059669"></i>购买力等值（扣除生活成本后）</span>
+      </div>
+      <div class="salary-bars city-mode">${cityBars}</div>
+    </div>
+    <div class="salary-city-tbl">
+      <table class="tbl compact">
+        <thead><tr><th>城市</th><th>月薪范围</th><th>月薪中位</th><th>购买力等值</th><th>年薪</th></tr></thead>
+        <tbody>${cityRows}</tbody>
+      </table>
+    </div>` : ''}
+
+    <div class="salary-demand">
+      <span class="dl">市场需求：</span><span class="tag ${demandTag}">${demandText}</span>
+      <span class="dl" style="margin-left:12px">数据可信度：</span><span class="tag ${confTagCls}">${conf === '未核实' ? '估算·待核实' : conf}</span>
+      <span class="dl" style="margin-left:auto;font-size:11px;color:var(--c-tx-3)">2025 实测快照：全国中位×城市系数=城市薪资；购买力=名义÷城市成本系数</span>
+    </div>
+  </div>`;
+})
 
 
-  return cards || '';
+
+
+  return (cards && cards.length) ? cards.join('') : '';
 
 }
 
@@ -4261,32 +4084,26 @@ function pageAnaSalary(c) {
 
 
 
-  // N 薪资增长趋势TOP10
+  // N 薪资真实同比 TOP10（仅统计有实测 YoY 来源的岗位）
   (function() {
     const growthList = [];
     for (const [k, s] of Object.entries(DB.salary)) {
-      const trend = s.trend || {};
-      const years = Object.keys(trend).sort();
-      if (years.length < 4) continue;
-      const earliest = trend[years[0]];
-      const latest = trend[years[years.length - 1]];
-      if (!earliest || !latest || !earliest.monthly_median || !latest.monthly_median) continue;
-      const growth = ((latest.monthly_median - earliest.monthly_median) / earliest.monthly_median * 100).toFixed(1);
+      if (typeof s.yoy_growth !== 'number') continue;
       const jobName = k.split('|')[1] || k;
-      growthList.push({ key: k, job: jobName, growth: parseFloat(growth), median: s.monthly_median });
+      growthList.push({ key: k, job: jobName, growth: s.yoy_growth, median: s.monthly_median });
     }
     growthList.sort((a, b) => b.growth - a.growth);
     const top10 = growthList.slice(0, 10);
-    if (!top10.length) { $('#crossJob2').innerHTML = '<p class="hint">暂无趋势数据</p>'; return; }
+    if (!top10.length) { $('#crossJob2').innerHTML = '<p class="hint">暂无岗位提供实测同比（YoY）来源，无法生成增长榜。</p>'; return; }
     const maxGrowth = Math.max(...top10.map(x => x.growth));
-    let h = '<table class="tbl compact"><thead><tr><th>排名</th><th>职业</th><th>年均增长</th><th>当前中位数</th><th>增长趋势</th></tr></thead><tbody>';
+    let h = '<table class="tbl compact"><thead><tr><th>排名</th><th>职业</th><th>真实同比</th><th>当前中位</th><th>幅度</th></tr></thead><tbody>';
     top10.forEach((x, i) => {
       const barWidth = (x.growth / maxGrowth * 100).toFixed(1);
-      const color = x.growth > 30 ? '#10b981' : x.growth > 15 ? '#f59e0b' : '#6b7280';
+      const color = x.growth > 0 ? '#10b981' : '#ef4444';
       h += `<tr><td><b>${i+1}</b></td><td><b>${esc(x.job)}</b></td><td style="color:${color};font-weight:600">+${x.growth}%</td><td>${(x.median/1000).toFixed(1)}k</td><td><div style="background:${color};height:8px;width:${barWidth}%;border-radius:4px"></div></td></tr>`;
     });
     h += '</tbody></table>';
-    h += '<p class="hint" style="margin-top:8px">基于2019-2025年（7年）薪资趋势数据，增长率 = (最新中位数 - 最早中位数) / 最早中位数 × 100%</p>';
+    h += '<p class="hint" style="margin-top:8px">真实同比仅统计招聘平台/薪酬报告明确给出 YoY 的岗位；未提供来源者不计入排名。</p>';
     $('#crossJob2').innerHTML = h;
   })();
 
@@ -5212,7 +5029,7 @@ function pageDataUpdate(c) {
 
             <tr><td>城市风控</td><td>${m.city_risk_count}</td><td>5个字段（行业编号、细分行业、城市、风险层级、风险评分）</td><td>不定期</td></tr>
 
-            <tr><td>薪资趋势</td><td>${salaryCount}</td><td>7年趋势（2020-2026月薪/年薪/增长率/需求）</td><td>不定期</td></tr>
+            <tr><td>薪资快照</td><td>${salaryCount}</td><td>2025 月薪分布（p10/中位/p90）+ 置信度 + 来源 + 真实同比</td><td>按研究进度</td></tr>
 
             <tr><td>城市信息</td><td>${m.city_count}</td><td>2个字段（城市名称、定位标签）</td><td>年度</td></tr>
 
@@ -5947,16 +5764,12 @@ function pageCompare(c) {
 
     }],
 
-    ['薪资趋势', j => {
-
+    ['2025薪资', j => {
       const sal = DB.salary[j['行业编号'] + '|' + j['常见职位']];
-
-      return sal && sal.trend && typeof sal.trend === 'object'
-
-      ? Object.keys(sal.trend).sort().slice(-1)[0] + '年: ' + (sal.trend[Object.keys(sal.trend).sort().slice(-1)[0]].growth_rate || '—')
-
-      : sal && sal.trend ? sal.trend : '—';
-
+      if (!sal) return '—';
+      const conf = sal.confidence || '未核实';
+      const yoy = (typeof sal.yoy_growth === 'number') ? (' 同比' + (sal.yoy_growth > 0 ? '+' : '') + sal.yoy_growth + '%') : '';
+      return '中位' + (sal.monthly_median / 1000).toFixed(1) + 'k' + yoy + ' · ' + (conf === '未核实' ? '待核实' : conf);
     }],
 
     ['需求程度', j => {
@@ -6135,7 +5948,7 @@ function generatePdfReport(industries, jobs, cities, allJobs, allRisks, opts) {
       '<div class="ind-hd">' +
         '<div class="ind-num">' + esc2(ind['行业编号']) + '</div>' +
         '<div class="ind-info"><div class="ind-name">' + esc2(ind['细分行业']) + '</div>' +
-        '<div class="ind-cat">' + esc2(ind['行业大类']) + '</div></div>' +
+        '<div class="ind-cat">' + esc2(ind['行业大类']) + (ind['国标大类'] ? ' › ' + (ind['国标大类代码'] && ind['国标大类代码'] !== '--' ? esc2(ind['国标大类代码']) + ' ' : '') + esc2(ind['国标大类']) : '') + '</div></div>' +
         '<div class="ind-lv" style="background:' + lvBg[riskLv] + ';color:' + lvColors[riskLv] + '">' + riskLv + ' ' + lvText[riskLv] + '</div>' +
       '</div>' +
       '<div class="ind-sec"><div class="ind-sec-hd">经营基本面</div><div class="kv-grid">' + f01Html + '</div></div>' +

@@ -1918,3 +1918,17 @@ select.input { cursor: pointer; }
 .dtab .dbg { margin-left: 6px; padding: 1px 6px; border-radius: 9px; font-size: 11px;
   background: #eef2f7; color: #64748b; font-weight: 600; }
 .dtab.on .dbg { background: rgba(255,255,255,.22); color: #fff; }
+
+/* ===== 薪资快照（2025 改造：分布 + 置信度 + 来源） ===== */
+.salary-dist { margin: 10px 2px 4px; }
+.dist-track { position: relative; height: 10px; border-radius: 5px; background: linear-gradient(90deg, #e2e8f0, #cbd5e1); }
+.dist-median { position: absolute; top: -3px; width: 3px; height: 16px; background: #1d4ed8; border-radius: 2px; transform: translateX(-50%); }
+.dist-legend { display: flex; justify-content: space-between; font-size: 11px; color: #64748b; margin-top: 4px; }
+.dist-legend .med { color: #1e40af; font-weight: 600; }
+.conf-badge { display: inline-block; padding: 1px 8px; border-radius: 9px; font-size: 11px; font-weight: 600; }
+.conf-badge.c-hi { background: #dcfce7; color: #15803d; }
+.conf-badge.c-mid { background: #dbeafe; color: #1d4ed8; }
+.conf-badge.c-lo { background: #ffedd5; color: #c2410c; }
+.conf-badge.c-unk { background: #f1f5f9; color: #64748b; }
+.salary-source { font-size: 11px; color: #64748b; margin: 8px 2px 0; line-height: 1.5; border-top: 1px dashed #e2e8f0; padding-top: 6px; }
+.fam-note { font-size: 11px; color: #0f766e; background: #f0fdfa; border: 1px solid #99f6e4; border-radius: 6px; padding: 4px 8px; margin: 6px 0 8px; display: inline-block; line-height: 1.5; }

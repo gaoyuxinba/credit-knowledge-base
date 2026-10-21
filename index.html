@@ -4,9 +4,22 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>小微行业信贷知识库 · 行业与岗位风险看板</title>
-<link rel="stylesheet" href="static/style.css?v=v151">
+<meta name="description" content="面向小微信贷的行业风控知识库：170 个细分行业档案、975 条岗位薪资、23 城风险矩阵与交叉验证钩子，支持行业分析、岗位核验、城市分析与额度测算。">
+<meta name="theme-color" content="#1d4ed8">
+<!-- 台账 A15：内网性质工具 + 内容含风控规则与核验话术，不纳入搜索引擎索引。
+     若日后希望公开收录，删除本行与根目录 robots.txt 即可。 -->
+<meta name="robots" content="noindex, nofollow, noarchive">
+<!-- 内联 SVG favicon：避免 /favicon.ico 404，且不增加一次网络请求 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231d4ed8'/%3E%3Ctext x='16' y='23' font-size='19' text-anchor='middle' fill='white'%3E%E5%8D%A1%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="static/style.css?v=v153">
 </head>
 <body>
+<noscript>
+  <div style="max-width:640px;margin:80px auto;padding:20px 24px;border:1px solid #f59e0b;border-left:4px solid #f59e0b;border-radius:8px;font-family:system-ui,-apple-system,'Microsoft YaHei',sans-serif;background:#fffbeb;">
+    <div style="font-size:17px;font-weight:700;color:#92400e;margin-bottom:8px;">需要启用 JavaScript</div>
+    <div style="font-size:14px;color:#78350f;line-height:1.7;">本知识库的数据在浏览器本地解密与渲染，必须启用 JavaScript 才能登录和查看。请在浏览器设置中开启后刷新页面。</div>
+  </div>
+</noscript>
 
 <!-- 登录页 -->
 <div id="loginView" class="login-wrap">
@@ -37,12 +50,14 @@
 
 <!-- 主界面 -->
 <div id="appView" class="app" hidden>
-  <aside class="sidebar" id="sidebar">
+  <!-- 台账 A19：改前全站 0 个 aria-*，读屏用户无法分辨地标，键盘焦点也没有视觉提示。
+       此处补齐 landmark / label / live region 三项基础语义。 -->
+  <aside class="sidebar" id="sidebar" role="navigation" aria-label="侧边导航">
     <div class="brand">
-      <span class="brand-ico">📊</span>
+      <span class="brand-ico" aria-hidden="true">📊</span>
       <span class="brand-txt">信贷知识库</span>
     </div>
-    <nav class="nav" id="nav"></nav>
+    <nav class="nav" id="nav" aria-label="功能页面"></nav>
     <div class="side-foot">
       <div id="metaMini" class="meta-mini"></div>
       <div class="side-update" id="dataUpdate"></div>
@@ -51,8 +66,8 @@
 
   <div class="main">
     <header class="topbar">
-      <button class="icon-btn only-mobile" id="navToggle" title="菜单">☰</button>
-      <div class="crumb" id="crumb">数据看板</div>
+      <button class="icon-btn only-mobile" id="navToggle" title="菜单" aria-label="展开/收起侧边导航" aria-expanded="false" aria-controls="sidebar">☰</button>
+      <div class="crumb" id="crumb" aria-live="polite">数据看板</div>
       <div class="top-right">
         <div class="userbox">
           <span class="avatar" id="userAvatar">管</span>
@@ -67,36 +82,37 @@
       </div>
     </header>
 
-    <main class="content" id="content"></main>
+    <main class="content" id="content" role="main" tabindex="-1"></main>
   </div>
 </div>
 
-<!-- 弹层 -->
+<!-- 弹层 · 台账 A19：dialog 语义 + 由 app.js 负责焦点陷阱与 Esc 归还焦点 -->
 <div class="modal-mask" id="modalMask" hidden>
-  <div class="modal" id="modalBox">
-    <div class="modal-head"><b id="modalTitle">标题</b><button class="icon-btn" id="modalClose">✕</button></div>
+  <div class="modal" id="modalBox" role="dialog" aria-modal="true" aria-labelledby="modalTitle" tabindex="-1">
+    <div class="modal-head"><b id="modalTitle">标题</b><button class="icon-btn" id="modalClose" aria-label="关闭弹窗">✕</button></div>
     <div class="modal-body" id="modalBody"></div>
     <div class="modal-foot" id="modalFoot"></div>
   </div>
 </div>
-<div class="toast-wrap" id="toastWrap"></div>
+<!-- 台账 A19：Toast 改前无 live region，读屏用户永远听不到"保存成功/加载失败"这类反馈 -->
+<div class="toast-wrap" id="toastWrap" role="status" aria-live="polite" aria-atomic="false"></div>
 
 <!-- 第三方库：仅用于「导出图片版PDF」，改为按需懒加载（见 app.js ensureExportLibs）。
      早期版本在此处同步阻塞加载 CDN，一旦 cdnjs 卡顿/超时会连带 app.js 无法执行，
      导致登录按钮失效、点击后表单原生提交把密码带进 URL。已彻底移出首屏关键路径。 -->
 
 <!-- 密钥环：仅含被各账号密码包装后的密钥，不含任何业务数据 -->
-<script src="static/keyring.js?v=v151"></script>
+<script src="static/keyring.js?v=v153"></script>
 <!-- V10.0：评级与分层「单一事实来源」（须在 app.js 之前） -->
-<script src="static/core_taxonomy.js?v=v151"></script>
+<script src="static/core_taxonomy.js?v=v153"></script>
 <!-- V10.0：统一行业装配层（把行业主表/模式/岗位/薪资/城市风险/深度档案合并为一份档案） -->
-<script src="static/profile.js?v=v151"></script>
+<script src="static/profile.js?v=v153"></script>
 <!-- V10.0：通用交叉验证引擎（由行业档案自带的钩子配置驱动） -->
-<script src="static/cross_engine.js?v=v151"></script>
+<script src="static/cross_engine.js?v=v153"></script>
 <!-- V12.2：全库字段一致性体检（只读，须在 app.js 之前） -->
-<script src="static/audit.js?v=v151"></script>
-<script src="static/app.js?v=v151"></script>
+<script src="static/audit.js?v=v153"></script>
+<script src="static/app.js?v=v153"></script>
 <!-- V10.0：行业深度档案页 + 数据勾稽看板（依赖 app.js，须在其后加载） -->
-<script src="static/deep_page.js?v=v151"></script>
+<script src="static/deep_page.js?v=v153"></script>
 </body>
 </html>

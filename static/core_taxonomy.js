@@ -31,8 +31,12 @@ window.XWK_TAXO = (function () {
   /* 只用上界判定，区间必须首尾相接 —— 否则 30.8 / 50.4 / 70.2 这类小数分
      会落在两段之间的空档里，被兜底判成 D（高风险），属系统性误判。 */
   function riskLevelOf(score) {
+    /* 无数据必须返回「未分级」，绝不能落进 A（低风险）。
+     * 否则 Number(null)===0 / Number('')===0 会命中 s<=30 判成 A，
+     * 把「没有数据」显示成「风险最低、常规受理」——这是方向相反的风控结论。 */
+    if (score === null || score === undefined || score === '') return '';
     var s = Number(score);
-    if (isNaN(s)) return '';
+    if (!isFinite(s)) return '';
     if (s <= RISK_BANDS[0].max) return RISK_BANDS[0].lv;
     for (var i = 1; i < RISK_BANDS.length; i++) {
       if (s <= RISK_BANDS[i].max) return RISK_BANDS[i].lv;

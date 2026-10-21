@@ -17,6 +17,46 @@ let DB = {
   meta: {}, industries: [], modes: [], cities: [], jobs: [], city_risks: [], salary: {}, city_factors: {}
 };
 
+/* ---- 查表索引 · 台账 A17 ----
+ * 原实现里 city_risks(3400 条) 与 jobs(975 条) 被多处 `Array.filter` 全表扫：
+ * 行业对比表对每个行业各扫一遍（≈80 × 3400），导出/搜索页同理，属 O(n×m)。
+ * 这里改成「按行业编号」建一次桶，之后 O(1) 取。
+ *
+ * 关键设计：索引用 WeakMap **按数组引用**缓存，而不是挂在 DB 上建一次。
+ * 原因是各处拿到的是不同数组 —— 有的是 `DB.city_risks` 原样，
+ * 有的是 `applyEdits('city_risks', DB.city_risks)` 应用了用户编辑的副本，
+ * 还有的是 `.filter()` 之后的中间数组。若只在装配时建一次，
+ * 编辑过的场景就会拿到旧内容（典型的「改了却没生效」）。
+ * 按引用缓存 + WeakMap 保证：内容一变就重建，数组被回收时索引也自动释放。
+ */
+const _IDX_CACHE = new WeakMap();
+function groupByIndex(arr, keyField) {
+  if (!arr || !arr.length) return null;
+  let cache = _IDX_CACHE.get(arr);
+  if (!cache) { cache = {}; _IDX_CACHE.set(arr, cache); }
+  const slot = '@' + keyField;
+  if (cache[slot]) return cache[slot];
+  const map = new Map();
+  for (let i = 0; i < arr.length; i++) {
+    const k = arr[i] ? String(arr[i][keyField] || '') : '';
+    let bucket = map.get(k);
+    if (!bucket) { bucket = []; map.set(k, bucket); }
+    bucket.push(arr[i]);
+  }
+  cache[slot] = map;
+  return map;
+}
+/* 取某个行业的全部城市风险记录 —— 替代 `DB.city_risks.filter(r => r['行业编号'] === code)` */
+function risksOfInd(code) {
+  const m = groupByIndex(DB.city_risks, '行业编号');
+  return (m && m.get(String(code || ''))) || [];
+}
+/* 取某个行业的全部岗位 —— 替代 `DB.jobs.filter(j => j['行业编号'] === code)` */
+function jobsOfInd(code) {
+  const m = groupByIndex(DB.jobs, '行业编号');
+  return (m && m.get(String(code || ''))) || [];
+}
+
 // 数据兼容：如果 salary 没有 trend 字段，从 years 字段生成
 function normalizeSalaryPart(part) {
   if (!part || !part.salary) return;
@@ -37,11 +77,21 @@ function normalizeSalaryPart(part) {
       }
     }
     if (sd.annual && !sd.annual_median) sd.annual_median = sd.annual;
+
+    /* 购买力指数单位归一。数据里 LS10（保安/安防）5 条是百分制忘了除 100（78/80/81/82/85），
+     * 而正常区间是 0.70~1.60，这 5 条会在薪资对比表直接显示成购买力 78~85。
+     * 只归一明显属于百分制的值（>50）；IT/NE 那批 2.0~7.67 是另一类问题（台账 B12），
+     * 不在这里改，避免把本来正确的值改错。 */
+    if (typeof sd.purchasing_power_index === 'number' && sd.purchasing_power_index > 50) {
+      sd.purchasing_power_index = Math.round(sd.purchasing_power_index) / 100;
+    }
   }
 }
 
 // 由解密后的 9 个分片组装 DB
 function buildDBFromParts(P) {
+  // P[7] 里也有 salary，原来只归一了 P[8]/P[9]，part7 的薪资没走归一（漏项）
+  normalizeSalaryPart(P[7]);
   normalizeSalaryPart(P[8]);
   normalizeSalaryPart(P[9]);
 
@@ -102,6 +152,128 @@ function buildDBFromParts(P) {
 
   DB.city_factors = (P[9] && P[9].city_factors) ? P[9].city_factors : {};
 
+  /* ---- 购买力指数（PPI）统一口径重算 · 台账 B12 ----
+   * 设计口径：pp = 月薪资中位数 ÷ 月基本生活成本基准。
+   * 基准 K 由 895 条正常记录反推校准得 3976，取整 4000。
+   * 原库存在内部矛盾：同行业中位薪资相同却给出不同 pp ——
+   *   IT01 研发总监 7.67 / 系统架构师 4.05 / 技术经理 2.09（md 均为 18340），
+   *   反推分母分别为 2391 / 4528 / 8775，实锤生成时基准被错用。
+   * 交叉验证：LS10 消控员 md=3390，原值 81（百分制漏除 100）归一后 0.81，
+   *   按 K=4000 重算得 0.85 —— 吻合，佐证口径正确。
+   * 原值一律保留到 purchasing_power_index_raw，便于追溯与审计。 */
+  (function () {
+    var PPI_BASE = 4000;
+    for (var k in DB.salary) {
+      var sd = DB.salary[k];
+      if (!sd) continue;
+      var md = Number(sd.monthly_median);
+      if (!isFinite(md) || md <= 0) continue;
+      var old = sd.purchasing_power_index;
+      if (old !== undefined && old !== null) sd.purchasing_power_index_raw = old;
+      sd.purchasing_power_index = Math.round(md / PPI_BASE * 100) / 100;
+    }
+  })();
+
+  /* ---- 薪资口径的来源键 · 台账 B8 / B9 共用 ----
+   * 《企业薪酬调查信息》里"档位桶"的写法有三种，必须分三条分支匹配：
+   *   职业中类202 工程技术人员·中级档 / 数字职业2021008 …·中级档 /
+   *   岗位等级·管理类-基层管理岗·中级档   ← 这一种比前两种多出一个 ·
+   * 不能图省事写成 `(?:职业中类|数字职业|岗位等级)[^·]*·档`：`[^·]*` 跨不过那个多余的 ·，
+   * 会漏匹配全部「岗位等级」类记录，桶数从 104 掉到 95（自测项 B9-a 抓到过这个问题）。 */
+  var RE_GRADE_BUCKET = /(?:职业中类(\d+)\s+[^\u00b7;；]+?|数字职业(\d+)\s+[^\u00b7;；]+?|岗位等级·([^\u00b7;；]+?))\u00b7(初级|中级|高级)档/;
+  var SALARY_BASIS_REAL = '实岗调研(招聘挂牌)';
+
+  /* ---- 薪资「套档」同档关系 · 台账 B8 ----
+   * 明文上实跑的结论（非静态推断）：975 条薪资只对应 116 个 (min,中位,max) 三元组，
+   * 再往下归到 104 个「职业中类×档」桶，**同一个桶必然落在同一组薪资上，0 例外**——
+   * 也就是说薪资完全由桶决定。其中 960 条标 `官方职业类别基准`（套档推算）、
+   * 仅 15 条标 `实岗调研(招聘挂牌)`，且没有任何一个三元组混用两套 basis。
+   * 最大的一档 `4600|6630|10310` 被 68 个岗位共用 —— 这绝非「一岗一薪」。
+   * 不显式标注的话，信审会把"按职业大类套出来的基准值"当成"该岗位真实行情"去定价。
+   */
+  DB.salaryPeerGroups = (function () {
+    var peers = {}, buckets = {};
+    Object.keys(DB.salary).forEach(function (k) {
+      var sd = DB.salary[k];
+      if (!sd) return;
+      var triple = [sd.monthly_min, sd.monthly_median, sd.monthly_max].join('|');
+      (peers[triple] = peers[triple] || []).push(k);
+      var m = String(sd.source || '').match(RE_GRADE_BUCKET);
+      if (!m) return;
+      var bk = (m[1] ? 'C' + m[1] : m[2] ? 'D' + m[2] : 'G' + m[3]) + '|' + m[4];
+      (buckets[bk] = buckets[bk] || {})[triple] = 1;
+    });
+    var splits = 0;
+    Object.keys(buckets).forEach(function (b) { if (Object.keys(buckets[b]).length > 1) splits++; });
+    return {
+      peer: peers,                 // 三元组 -> 共用该组薪资的岗位 key 列表
+      peerCount: Object.keys(peers).length,
+      bucketCount: Object.keys(buckets).length,
+      bucketSplits: splits,        // 同一职档却给了不同薪资的组数（现为 0，用于回归校验）
+      realKey: SALARY_BASIS_REAL
+    };
+  })();
+
+  /* ---- 同行业「两套口径混排」 · 台账 B9 ----
+   * 清单原登记的「46 处职级倒挂」经明文复核**不成立**：
+   *   在「同行业 + 同职业中类」内部档位阶梯严格单调，倒挂 = 0；
+   *   跨职业类别硬比出的 67 对（如 延保顾问 vs 车贷专员）属苹果比橘子，不是数据缺陷。
+   * 真问题是两套口径在同一行业内混排：170 个行业中有 12 个同时含
+   *   实岗调研（最高值）与套档推算（区间），高低相差中位数 2.48 倍，
+   *   EC01 最极端 —— 套档 7430 与实岗 31000 并排展示，差 4.17 倍。
+   * 信审若直接做同行业薪资排序就会得出错误结论。
+   * → 每条记录都有可查出处，数据源本身合法，**不篡改任何数值**，改为在 UI 给出行业级告警。
+   */
+  DB.salaryBasisByInd = (function () {
+    var byInd = {};
+    Object.keys(DB.salary).forEach(function (k) {
+      var sd = DB.salary[k];
+      if (!sd) return;
+      var ind = String(k).split('|')[0];
+      var row = byInd[ind] || (byInd[ind] = { real: 0, bench: 0, realMax: 0, benchMin: 0, benchMax: 0, mixed: false, ratio: 0 });
+      var md = Number(sd.monthly_median) || 0;
+      if (sd.basis === SALARY_BASIS_REAL) {
+        row.real++;
+        if (md > row.realMax) row.realMax = md;
+      } else {
+        row.bench++;
+        if (!row.benchMin || md < row.benchMin) row.benchMin = md;
+        if (md > row.benchMax) row.benchMax = md;
+      }
+    });
+    Object.keys(byInd).forEach(function (i) {
+      var r = byInd[i];
+      r.mixed = r.real > 0 && r.bench > 0;
+      r.ratio = (r.mixed && r.benchMin) ? Math.round(r.realMax / r.benchMin * 100) / 100 : 0;
+    });
+    return byInd;
+  })();
+
+  /* ---- 城市风险矩阵覆盖率 · 台账 B3 ----
+   * 23 个城市并非等覆盖：17 城满 170 条、东莞/佛山/太原 166 条、
+   * 福州/济南/沈阳 各仅 4 条。样本不足的城市若参与"城市均分排名"会给出
+   * 不可比甚至误导的结论，故在此统一标记，由 UI 决定降级或排除。 */
+  DB.cityRiskCoverage = (function () {
+    var raw = {}, full = 0;
+    (DB.city_risks || []).forEach(function (r) {
+      var c = r['城市'];
+      if (!c) return;
+      raw[c] = (raw[c] || 0) + 1;
+      if (raw[c] > full) full = raw[c];
+    });
+    var out = {};
+    Object.keys(raw).forEach(function (c) {
+      out[c] = { n: raw[c], full: full, ratio: full ? raw[c] / full : 0, thin: raw[c] < full * 0.5 };
+    });
+    return out;
+  })();
+
+  /* V15.0 岗位族×城市薪资系数的两张表与 city_factors 同在 part9，
+   * 此前漏装配 → jobFamilyOf() 恒返回 'white'、citySalaryFactor() 恒回退旧的单一家系数、
+   * cityFactorConfidence() 恒为空，等于页面标了「已按岗位族折算」但实际没做。 */
+  DB.position_family = (P[9] && P[9].position_family) ? P[9].position_family : {};
+  DB.city_factors_family = (P[9] && P[9].city_factors_family) ? P[9].city_factors_family : {};
+
   // V9.5：行业深度档案（第 10 个分片，可选；未覆盖时为空）
   DB.deepDossier = (P[10] && typeof P[10] === 'object') ? P[10] : null;
 
@@ -130,6 +302,13 @@ function buildDBFromParts(P) {
     console.error('[装配层] 构建失败，回退为逐表读取：', e);
     DB.profile = null;
   }
+
+  /* 数据修复必须在装配完成之后跑：原写法是顶层 IIFE，执行时 DB 还是空的（台账 A8）。 */
+  try {
+    if (typeof fixData === 'function') fixData();
+  } catch (e) {
+    console.warn('[数据修复] 执行失败，跳过（不影响主流程）：', e);
+  }
 }
 
 /* ---- V10.0 统一口径读取助手：所有页面必须经此取数，不得直连底层表 ---- */
@@ -147,7 +326,15 @@ function LV_BG(lv)    { return (typeof XWK_TAXO !== 'undefined') ? XWK_TAXO.risk
 function LV_LABEL(lv) { return (typeof XWK_TAXO !== 'undefined') ? XWK_TAXO.riskMeta(lv).label : '—'; }
 
 /* 全站统一版本号（与 data1.js meta.version / build_city_research.js / index.html 缓存参数保持一致） */
-const APP_VERSION = 'V12.5';
+const APP_VERSION = 'V15.1';
+
+/* ---- 台账 B11 · 全站构建号（缓存标签的唯一来源） ----
+ * 只要改了任何一个 js / css，**必须把这个数 +1**，再跑一次 `_tools/check_version.mjs`，
+ * 否则浏览器会继续吃旧缓存，表现就是「明明改了却没生效」。
+ *   • 数据分片的缓存标签 DATA_CACHE_TAG 由它派生（见下方 fetchShard）；
+ *   • index.html 里 8 处 <script>/<link> 的 ?v= 必须与它完全一致。
+ * 校验与一键同步：`node _tools/check_version.mjs`（只读校验）/ `node _tools/check_version.mjs --bump v154` */
+const XWK_BUILD = 'v153';
 
 /* ---- H2 数据可信度标识 ----
  * 目的：让用户一眼看出哪些内容是核实过的深内容（L4/L3）、哪些是主表基础信息（L2/L1）、
@@ -283,7 +470,7 @@ function jobTreeHtml(j) {
 
 const EDITS_KEY = 'xwk_edits_v4';
 
-function loadEdits() { try { return JSON.parse(localStorage.getItem(EDITS_KEY) || '{}'); } catch { return {}; } }
+function loadEdits() { try { return JSON.parse(localStorage.getItem(EDITS_KEY) || '{}'); } catch (e) { return {}; } }
 
 function saveEdits(e) { localStorage.setItem(EDITS_KEY, JSON.stringify(e)); }
 
@@ -309,6 +496,18 @@ function applyEdits(collection, records) {
 
 
 
+/* localStorage 读取兜底。GitHub Pages 下同一用户的所有仓库共用 localStorage 源，
+ * 任一 key 被写坏（或被别的站点占用成非法 JSON），顶层裸 JSON.parse 会直接抛错，
+ * 导致 app.js 后半段不执行 —— 表现是登录按钮点了没反应、整页白屏且无法自愈。 */
+function lsJSON(key, def) {
+  try {
+    var raw = localStorage.getItem(key);
+    if (!raw) return def;
+    var v = JSON.parse(raw);
+    return (v === null || v === undefined) ? def : v;
+  } catch (e) { return def; }
+}
+
 // ------------------------------------------------------------------ 状态
 
 const S = {
@@ -327,13 +526,13 @@ const S = {
 
   cache: {},
 
-  favorites: JSON.parse(localStorage.getItem('xwk_favs_v4') || '{"industries":[],"jobs":[],"cities":[]}'),
+  favorites: lsJSON('xwk_favs_v4', { industries: [], jobs: [], cities: [] }),
 
-  compare: JSON.parse(localStorage.getItem('xwk_cmp_v4') || '[]'),
+  compare: lsJSON('xwk_cmp_v4', []),
 
-  indCompare: JSON.parse(localStorage.getItem('xwk_indcmp_v4') || '[]'),
+  indCompare: lsJSON('xwk_indcmp_v4', []),
 
-  recent: JSON.parse(localStorage.getItem('xwk_recent_v4') || '[]'),
+  recent: lsJSON('xwk_recent_v4', []),
 
   theme: localStorage.getItem('xwk_theme_v4') || 'light',
 
@@ -343,9 +542,9 @@ const S = {
 // ---- 本地存储封装（安全、统一前缀）
 const Storage = {
   _p: 'xwk_',
-  get(k, def) { try { const v = localStorage.getItem(this._p + k); return v == null ? def : JSON.parse(v); } catch { return def; } },
-  set(k, v) { try { localStorage.setItem(this._p + k, JSON.stringify(v)); } catch {} },
-  remove(k) { try { localStorage.removeItem(this._p + k); } catch {} },
+  get(k, def) { try { const v = localStorage.getItem(this._p + k); return v == null ? def : JSON.parse(v); } catch (e) { return def; } },
+  set(k, v) { try { localStorage.setItem(this._p + k, JSON.stringify(v)); } catch (e) {} },
+  remove(k) { try { localStorage.removeItem(this._p + k); } catch (e) {} },
 };
 
 // ---- 最近浏览记录（最多20条，按时间倒序）
@@ -406,7 +605,7 @@ window.onerror = function(msg, url, line, col, err) {
     el.textContent = '页面出错：' + String(msg).substring(0, 50);
     document.body.appendChild(el);
     setTimeout(() => el.remove(), 5000);
-  } catch {}
+  } catch (e) {}
   return false;
 };
 
@@ -895,6 +1094,10 @@ function toast(title, msg, type) {
 
   el.className = 'toast' + (type ? ' ' + type : '');
 
+  // 台账 A19：容器已是 role=status/aria-live=polite，错误条单独提到 assertive，
+  // 否则读屏用户不会感知"导入失败/导出失败"这类必须立刻知道的结果。
+  if (type === 'err') { el.setAttribute('role', 'alert'); el.setAttribute('aria-live', 'assertive'); }
+
   el.innerHTML = `<b>${esc(title)}</b>` + (msg ? `<small>${esc(msg)}</small>` : '');
 
   w.appendChild(el);
@@ -907,9 +1110,18 @@ function toast(title, msg, type) {
 
 // ------------------------------------------------------------------ 弹层
 
+/* 台账 A19：弹层改前没有焦点管理 —— 打开后焦点仍留在背景页面上，
+ * Tab 会走到被遮罩盖住的交互元素里，读屏用户完全不知道弹窗已打开。
+ * 这里补三件事：① 打开时把焦点移进弹窗并记住来源焦点；② Tab 在弹窗内循环；
+ * ③ Esc / 关闭时把焦点还给来源元素。 */
+const FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+let _modalPrevFocus = null;
+
 function modal(title, bodyHtml, footHtml, opts) {
 
   opts = opts || {};
+
+  _modalPrevFocus = document.activeElement;
 
   $('#modalTitle').textContent = title;
 
@@ -921,11 +1133,42 @@ function modal(title, bodyHtml, footHtml, opts) {
 
   $('#modalMask').hidden = false;
 
+  const first = $('#modalBox').querySelector(FOCUSABLE);
+
+  (first || $('#modalBox')).focus({ preventScroll: false });
+
 }
 
-function closeModal() { $('#modalMask').hidden = true; $('#modalBody').innerHTML = ''; $('#modalFoot').innerHTML = ''; }
+function closeModal() {
+  $('#modalMask').hidden = true;
+  $('#modalBody').innerHTML = '';
+  $('#modalFoot').innerHTML = '';
+  // 焦点归还：不把焦点还给一个已经从 DOM 里移除的元素（此时会掉到 body）。
+  if (_modalPrevFocus && document.contains(_modalPrevFocus)) {
+    try { _modalPrevFocus.focus({ preventScroll: false }); } catch (e) { /* 元素不可聚焦则忽略 */ }
+  }
+  _modalPrevFocus = null;
+}
 
 $('#modalClose').onclick = closeModal;
+
+/* Esc 关闭 */
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape' && !$('#modalMask').hidden) { e.preventDefault(); closeModal(); }
+});
+
+/* Tab 焦点陷阱 */
+document.addEventListener('keydown', function (e) {
+  if (e.key !== 'Tab' || $('#modalMask').hidden) return;
+  const box = $('#modalBox');
+  const items = Array.prototype.filter.call(box.querySelectorAll(FOCUSABLE), function (el) {
+    return el.offsetParent !== null || el === document.activeElement;
+  });
+  if (!items.length) { e.preventDefault(); box.focus(); return; }
+  const first = items[0], last = items[items.length - 1];
+  if (e.shiftKey && (document.activeElement === first || document.activeElement === box)) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+});
 
 $('#modalMask').onclick = (e) => { if (e.target === $('#modalMask')) closeModal(); };
 
@@ -1322,16 +1565,23 @@ async function gcmDecrypt(key, iv, dataWithTag, aad) {
   return new Uint8Array(plain);
 }
 
+/* 数据分片缓存标签：必须与 index.html 里的 ?v= 同步递增。
+   台账 A11：原先用 cache:'no-store'，27MB / 11 个分片每次登录全量重下；
+   改为带版本参数 + 默认缓存，二次登录可命中 304，数据变更时递增标签即强制取新。
+   台账 B11：不再手写第二个常量 —— 直接由上面的 XWK_BUILD 派生，
+   杜绝「改了 XWK_BUILD 忘了改这里」导致的缓存不同步。 */
+const DATA_CACHE_TAG = XWK_BUILD;
+
 // 单个分片下载：45s 超时 + 失败自动重试 2 次（网络抖动不必从头再来）
 async function fetchShard(name) {
-  const url = 'static/data/' + name;
+  const url = 'static/data/' + name + '?v=' + DATA_CACHE_TAG;
   let lastErr = null;
   for (let t = 0; t < 3; t++) {
     let timer = null;
     try {
       const ctl = (window.AbortController) ? new AbortController() : null;
       if (ctl) timer = setTimeout(function () { ctl.abort(); }, 45000);
-      const res = await fetch(url, { cache: 'no-store', signal: ctl ? ctl.signal : undefined });
+      const res = await fetch(url, { signal: ctl ? ctl.signal : undefined });
       if (timer) clearTimeout(timer);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       return new Uint8Array(await res.arrayBuffer());
@@ -1407,15 +1657,20 @@ async function unlockData(user, pass, onProgress) {
 // html2canvas / jsPDF 只服务于「图片版PDF导出」，登录与浏览完全不需要。
 // 早期版本放在 index.html 头部同步加载，cdnjs 一旦卡顿/超时（实测曾 20s 超时），
 // 会阻塞 HTML 解析导致 app.js 不执行 → 登录按钮失效 → 点击后表单原生提交。
+/* 台账 A14：原来从 3 个公网 CDN 动态注入、且没有 SRI 校验。
+   本页登录后内存中持有全量解密档案，第三方 CDN 一旦被劫持或投毒，
+   注入的脚本可直接读取业务明文 —— 这不是"导出功能不可用"级别的问题。
+   现改为自托管到 static/vendor/（同源、零外部依赖、断网也能导出），
+   仅当本地文件缺失时才回退 CDN。版本号与原先保持一致：
+   html2canvas 1.4.1（198KB）、jsPDF 2.5.1（364KB）。 */
+const VENDOR = 'static/vendor/';
 const EXPORT_LIBS = [
   { name: 'html2canvas', test: function () { return typeof window.html2canvas === 'function'; },
-    urls: ['https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',
-           'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js',
-           'https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js'] },
+    urls: [VENDOR + 'html2canvas.min.js',
+           'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js'] },
   { name: 'jspdf', test: function () { return !!(window.jspdf && typeof window.jspdf.jsPDF === 'function'); },
-    urls: ['https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js',
-           'https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js',
-           'https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js'] }
+    urls: [VENDOR + 'jspdf.umd.min.js',
+           'https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js'] }
 ];
 let _exportLibsPromise = null;
 function loadScriptWithTimeout(url, ms) {
@@ -1439,7 +1694,7 @@ function ensureExportLibs() {
       for (const url of lib.urls) {
         try { await loadScriptWithTimeout(url, 12000); if (lib.test()) { ok = true; break; } } catch (e) {}
       }
-      if (!ok) { _exportLibsPromise = null; throw new Error('导出组件 ' + lib.name + ' 加载失败（已尝试 3 个 CDN）'); }
+      if (!ok) { _exportLibsPromise = null; throw new Error('导出组件 ' + lib.name + ' 加载失败（本地文件与 CDN 备用源均不可用）'); }
     }
     return true;
   })();
@@ -1501,10 +1756,20 @@ function initShortcuts() {
     // Ctrl/Cmd + K 聚焦搜索框
     if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
       e.preventDefault();
-      const searchInput = document.getElementById('globalSearch');
+      /* 台账 A9：真实输入框的 id 是 #gsQ（全局搜索页），#globalSearch 并不存在，
+       * 旧写法取到的永远是 null → Ctrl+K 从未生效过。同时补上切到搜索页的逻辑，
+       * 否则输入框在别的页面上时聚焦了也看不见。 */
+      const searchInput = document.getElementById('gsQ');
       if (searchInput) {
-        searchInput.focus();
-        searchInput.select();
+        const navItem = document.querySelector('.nav-item[data-page="search"]')
+          || document.querySelector('.nav-item[data-page="ana-search"]');
+        if (navItem && typeof navItem.click === 'function') {
+          try { navItem.click(); } catch (err) {}
+        }
+        setTimeout(function () {
+          searchInput.focus();
+          searchInput.select();
+        }, 60);
       }
     }
     // ESC 关闭弹窗
@@ -1595,7 +1860,9 @@ async function doLogin() {
   if (decryptErr) { decryptErr.style.color = ''; decryptErr.textContent = ''; }
   resetUI();
 
-  try { localStorage.removeItem('xwk_edits_v4'); localStorage.removeItem('xwk_saved_v2'); localStorage.removeItem('xwk_recent_v2'); } catch(e) {}
+  /* 只清理 v2 时代的旧键。'xwk_edits_v4' 就是当前 EDITS_KEY（app.js:284），
+   * 之前把它一起删掉，等于每次登录静默清空用户在本站做的全部编辑。 */
+  try { localStorage.removeItem('xwk_saved_v2'); localStorage.removeItem('xwk_recent_v2'); } catch(e) {}
 
   S.user = acc;
 
@@ -1627,7 +1894,21 @@ $('#userMenu').onclick = (e) => {
 
   if (e.target.dataset.act === 'logout') {
 
+    /* 登出必须把解密后的明文从内存里清掉。DB 里是整个知识库的全量档案，
+     * 不清的话共享/公用电脑上一个人登出后，下一个人仍能从控制台读到全部数据。 */
+    try {
+      for (const k in DB) {
+        DB[k] = (Array.isArray(DB[k])) ? [] : (DB[k] && typeof DB[k] === 'object') ? {} : (typeof DB[k] === 'string' ? '' : null);
+      }
+      DB.meta = {}; DB.industries = []; DB.modes = []; DB.cities = []; DB.jobs = [];
+      DB.city_risks = []; DB.salary = {}; DB.city_factors = {};
+      DB.position_family = {}; DB.city_factors_family = {};
+      DB.deepDossier = null; DB.cityResearch = null; DB.profile = null; DB.cityMaster = null;
+    } catch (e) {}
     S.user = null;
+    S.dash = { industry: '', job: '', city: '', ci: new Set(), cj: new Set(), cc: new Set(), queried: false };
+    S.cache = {};
+    const _c = document.getElementById('content'); if (_c) _c.innerHTML = '';
     try { localStorage.removeItem('xwk_user_v4'); sessionStorage.removeItem('xwk_user_v4'); } catch(e) {}
 
     $('#appView').hidden = true;
@@ -1740,7 +2021,7 @@ function pageDashboard(c) {
 
       </div>
 
-      <div class="stat-card s-orange" data-tip="975条薪资数据&#10;含月薪中位数/区间/趋势&#10;含购买力指数PPI">
+      <div class="stat-card s-orange" data-tip="975条薪资数据&#10;含月薪中位数与区间&#10;含购买力指数PPI（暂无历史趋势）">
 
         <div class="stat-glow"></div>
 
@@ -3154,9 +3435,23 @@ function sec06(indCode, jobNames, selectedCities) {
   const demandText = sd.demand === '高' ? '需求旺盛' : sd.demand === '中' ? '需求稳定' : '需求一般';
   const confTagCls = conf === '高' ? 'tag-green' : conf === '中' ? 'tag-blue' : conf === '低' ? 'tag-orange' : 'tag-gray';
 
+  /* ---- 台账 B8：本条薪资到底是怎么算出来的 ----
+   * 只标的往往不是"这个岗位真实行情"，而是它所属档位的基准值（见 DB.salaryPeerGroups）。 */
+  const PG = DB.salaryPeerGroups || { peer: {}, realKey: '实岗调研(招聘挂牌)' };
+  const isRealBasis = sd.basis === PG.realKey;
+  const peerList = PG.peer[[sd.monthly_min, sd.monthly_median, sd.monthly_max].join('|')] || [];
+  const basisBadge = isRealBasis
+    ? '<span class="basis-tag basis-real" title="来自公开招聘挂牌 / 第三方薪酬报告的实岗调研结果，可直接参考">✓ 实岗调研</span>'
+    : '<span class="basis-tag basis-bench" title="按「人社部职业中类 × 初级/中级/高级档」套档推算，并非该岗位单独的实岗调研结果">套档基准</span>';
+  const peerNote = peerList.length > 1
+    ? '<span class="basis-peer" title="共用同一档位薪资的岗位：' +
+      esc(peerList.slice(0, 10).map(function (p) { return String(p).split('|')[1]; }).join('、')) +
+      (peerList.length > 10 ? ' 等 ' + peerList.length + ' 个' : '') + '">另有 ' + (peerList.length - 1) + ' 个岗位同档</span>'
+    : '';
+
   return `<div class="salary-card fade-in">
     <div class="card-hd"><h3><span class="no">06</span>${esc(jn)} · 2025 薪资快照</h3>
-      <div class="sub">基准中位 ${baseMedian}k · <span class="conf-badge ${confCls}">${conf === '未核实' ? '估算·待核实' : conf + '置信'}</span></div></div>
+      <div class="sub">基准中位 ${baseMedian}k · <span class="conf-badge ${confCls}">${conf === '未核实' ? '估算·待核实' : conf + '置信'}</span>${basisBadge}${peerNote}</div></div>
     <div class="salary-grid">
       <div class="salary-stat"><div class="sl">基准月薪(中位)</div><div class="sv">${baseMedian}k</div></div>
       <div class="salary-stat"><div class="sl">月薪范围</div><div class="sv">${(lo/1000).toFixed(1)}k<small> - ${(hi/1000).toFixed(1)}k</small></div></div>
@@ -3164,7 +3459,7 @@ function sec06(indCode, jobNames, selectedCities) {
       <div class="salary-stat"><div class="sl">真实同比</div><div class="sv">${yoy}</div><div class="delta ${ (typeof sd.yoy_growth==='number' && sd.yoy_growth>0)?'up':'down'}">${ (typeof sd.yoy_growth==='number')? ((sd.yoy_growth>0?'↑':'↓')+' '+Math.abs(sd.yoy_growth)+'%') : '无实测来源'}</div></div>
     </div>
     ${distBar}
-    <div class="salary-source">📌 来源：${sd.source ? esc(sd.source) : '暂无实测来源（沿用历史估算值，待核实）'}${sd.updated ? ' · ' + esc(sd.updated) : ''}</div>
+    <div class="salary-source">📌 口径：${basisBadge}${isRealBasis ? ' 该岗位有公开招聘/第三方报告直接佐证' : ' 按「人社部职业中类 × 档位」套档推算，非本岗位单独调研值，仅作同档岗位的一般水平参考'}<br>来源：${sd.source ? esc(sd.source) : '暂无实测来源（沿用历史估算值，待核实）'}${sd.updated ? ' · ' + esc(sd.updated) : ''}</div>
 
     ${cities.length > 1 || (cities.length === 1 && cities[0] !== '重庆') ? `
     <div class="salary-city-chart">
@@ -3194,7 +3489,19 @@ function sec06(indCode, jobNames, selectedCities) {
 
 
 
-  return (cards && cards.length) ? cards.join('') : '';
+  /* 台账 B9：同一行业内若两套口径混排（既有实岗调研又有套档），
+   * 直接把不同岗位的薪资横向排序会得出错误结论 —— 170 个行业里有 12 个是这种情况，
+   * EC01 最极端：套档 7.4k 与实岗 31k 并排，差 4.17 倍。
+   * 在卡片列表最顶部给出行业级提示，避免逐张卡片去看标签。 */
+  const indBasis = indCode ? (DB.salaryBasisByInd || {})[indCode] : null;
+  const mixWarn = (indBasis && indBasis.mixed) ? `<div class="basis-mixed-warn">
+      ⚠ <b>本行业薪资由两套口径构成，直接横向比较会失真。</b>
+      <span>${indBasis.real} 个岗位为招聘实岗调研（最高 ${(indBasis.realMax / 1000).toFixed(1)}k）；
+      ${indBasis.bench} 个岗位按「人社部职业中类 × 初级/中级/高级档」套档推算（${(indBasis.benchMin / 1000).toFixed(1)}k ~ ${(indBasis.benchMax / 1000).toFixed(1)}k）。</span>
+      <span>两者最高相差 <b>${indBasis.ratio} 倍</b>，做同行业薪资排序前请先确认每张卡片的「实岗调研 / 套档基准」标签。</span>
+    </div>` : '';
+
+  return (cards && cards.length) ? (mixWarn + cards.join('')) : (mixWarn || '');
 
 }
 
@@ -3714,7 +4021,13 @@ function pageAnaJob(c) {
         const s = x.salary;
         const trend = s.trend || {};
         const last = trend['2025'] || trend['2024'] || {};
-        const trendIcon = (last.monthly_median || 0) > s.monthly_median ? '↑' : '↓';
+        /* 台账 B6：全库 975 条薪资均无 trend/years/annual，last 恒为 {}。
+         * 旧写法 (last.monthly_median||0) > md 恒为 false → 所有行业一律渲染 ↓，
+         * 等于告诉用户「全行业薪资都在跌」，属无数据支撑的反向结论。
+         * 无趋势数据时一律渲染 —。 */
+        const trendIcon = (typeof last.monthly_median === 'number' && last.monthly_median > 0)
+          ? ((last.monthly_median > s.monthly_median) ? '↑' : (last.monthly_median < s.monthly_median ? '↓' : '—'))
+          : '<span style="color:#cbd5e1">—</span>';
         h += `<tr><td>${esc(x.industry)}</td><td><b>${(s.monthly_median/1000).toFixed(1)}k</b></td><td>${(s.monthly_min/1000).toFixed(1)}-${(s.monthly_max/1000).toFixed(1)}k</td><td>${s.purchasing_power_index || '—'}</td><td>${trendIcon}</td></tr>`;
       }
       h += '</tbody></table>';
@@ -4154,7 +4467,7 @@ function pageAnaSalary(c) {
 
       </div></div>
 
-    <div class="card fade-in">${cardHead('N', '薪资增长趋势TOP10', '近7年年均增长率最高的职业')}
+    <div class="card fade-in">${cardHead('N', '薪资同比增速榜', '仅统计带实测 YoY 来源的岗位，无来源则不入榜')}
       <div class="card-bd"><div class="tbl-wrap" id="crossJob2"></div></div></div>
 
     <div class="card fade-in" style="grid-column:1/-1">${cardHead('🏙', '全城市薪资 vs 购买力对比', '23个城市的平均月薪与购买力等值')}
@@ -4965,7 +5278,7 @@ function hlText(text, kw) {
 
   try { return t.replace(new RegExp('(' + k + ')', 'gi'), '<span class="hl">$1</span>'); }
 
-  catch { return t; }
+  catch (e) { return t; }
 
 }
 
@@ -4976,6 +5289,22 @@ function hlText(text, kw) {
 function pageDataUpdate(c) {
 
   const m = DB.meta;
+
+  /* 城市风控矩阵的真实覆盖。旧文案直接写「城市数 × 行业数 = 条数」，
+   * 而实际矩阵并非满覆盖（17 城 170 条 / 东莞·佛山·太原 166 条 / 福州·济南·沈阳 仅 4 条），
+   * 原算式 23 × 170 = 3910 ≠ 3400，是用户能直接看见的算术错误。这里改为按真实数据算。 */
+  const crCity = (function () {
+    const cnt = {};
+    (DB.city_risks || []).forEach(function (r) {
+      const cn = r['城市']; if (cn) cnt[cn] = (cnt[cn] || 0) + 1;
+    });
+    return cnt;
+  })();
+  const crFull = Object.keys(crCity).filter(function (cn) { return crCity[cn] >= 100; });
+  const crThin = Object.keys(crCity).filter(function (cn) { return crCity[cn] < 100; });
+  const crCovTxt = m.industry_count + '个细分行业 × ' + crFull.length + '个重点城市，已生成 '
+    + m.city_risk_count + '条城市风控记录'
+    + (crThin.length ? '（' + crThin.join('、') + '各仅 ' + crCity[crThin[0]] + ' 条，未纳入矩阵，见城市分析页）' : '');
 
   const jobCount = DB.jobs.length;
 
@@ -5015,7 +5344,7 @@ function pageDataUpdate(c) {
 
         <div class="uv">${salaryCount}</div>
 
-        <div class="ud">2020-2026年7年趋势<br>含月薪范围、年薪、增长率、需求热度</div>
+        <div class="ud">月薪区间 + 购买力指数<br>历史趋势与年薪暂未接入</div>
 
       </div>
 
@@ -5081,7 +5410,8 @@ function pageDataUpdate(c) {
 
         <div style="margin-top:12px;padding:12px 14px;background:#f0fdf4;border-radius:8px;border-left:3px solid #059669">
 
-          <p class="hint" style="margin:0"><b>计算方法</b>：行业基准薪资 × 职位倍数 = 基准月薪；基准月薪 × 城市系数 = 城市薪资；按行业年增长率推算2020-2026年趋势。<br>
+          <p class="hint" style="margin:0"><b>计算方法</b>：行业基准薪资 × 职位倍数 = 基准月薪；基准月薪 × 城市系数 = 城市薪资。<br>
+          <span style="color:#b45309">注：当前快照未包含历史年度序列，页面不提供年度趋势推算；涉及"同比/增长"的展示一律以数据自带的实测 YoY 来源为准，无来源则显示"—"。</span><br>
 
           <b>数据特点</b>：各行业增长率不同（+1.9%~+10.3%），各城市系数不同（北京1.85 vs 重庆0.94），体现真实差异。</p>
 
@@ -5121,7 +5451,7 @@ function pageDataUpdate(c) {
 
           <p class="hint" style="margin:0"><b>评估方法</b>：采用五维加权评分模型，综合得分0-100分，对应A/B/C/D四个风险等级（A: 低风险，B: 中低风险，C: 中等风险，D: 高风险）。<br>
 
-          <b>数据规模</b>：${m.city_count}个城市 × ${m.industry_count}个细分行业 = ${m.city_risk_count}条城市风控记录，每条含风险层级与风险评分（按统一口径 A 0-30 / B 31-50 / C 51-70 / D 71-100 重算）。<br>
+          <b>数据规模</b>：${crCovTxt}，每条含风险层级与风险评分（按统一口径 A 0-30 / B 31-50 / C 51-70 / D 71-100 重算）。<br>
           <b>城市差异怎么看</b>：行业×城市的实地调研目前只覆盖了部分行业；未覆盖的组合不编结论，改在「城市风险分级」与「小微行业交叉验证看板」里按「行业成本基准 × 城市租金/人工/消费力系数」换算，口径随表标注。<br>
 
           <b>使用提示</b>：风险等级为信贷审批提供参考依据，实际决策需结合客户经营状况、财务数据、担保条件等综合判断。</p>
@@ -5567,7 +5897,7 @@ function pageIndCompare(c) {
     // 计算各行业的平均风险评分
     const riskScores = {};
     industries.forEach(ind => {
-      const risks = DB.city_risks.filter(r => r['行业编号'] === ind['行业编号']);
+      const risks = risksOfInd(ind['行业编号']);
       if (risks.length) {
         const avg = risks.reduce((s, r) => s + (r['风险评分'] || 0), 0) / risks.length;
         riskScores[ind['行业编号']] = Math.round(avg);
@@ -5579,7 +5909,7 @@ function pageIndCompare(c) {
     // 计算岗位数量
     const jobCounts = {};
     industries.forEach(ind => {
-      jobCounts[ind['行业编号']] = DB.jobs.filter(j => j['行业编号'] === ind['行业编号']).length;
+      jobCounts[ind['行业编号']] = jobsOfInd(ind['行业编号']).length;
     });
 
     html += '<div style="overflow-x:auto;"><table class="tbl ind-cmp-table" style="min-width:700px;">';
@@ -6025,21 +6355,38 @@ function generatePdfReport(industries, jobs, cities, allJobs, allRisks, opts) {
   // 每个行业的详细卡片（受 MAX_CARD 上限控制，上限在导出弹窗可调）
   var cardInds = OPT_IND ? industries.slice(0, MAX_CARD) : [];
   var indCardsHtml = cardInds.map(function(ind) {
-    var indModes = modes.filter(function(m) { return m['行业编号'] === ind['行业编号']; });
-    var indRisks = filteredRisks.filter(function(r) { return r['行业编号'] === ind['行业编号']; });
-    var indJobs = jobs.filter(function(j) { return j['行业编号'] === ind['行业编号']; });
+    var indModes = (groupByIndex(modes, '行业编号') || new Map()).get(String(ind['行业编号'])) || [];
+    var indRisks = (groupByIndex(filteredRisks, '行业编号') || new Map()).get(String(ind['行业编号'])) || [];
+    var indJobs = (groupByIndex(jobs, '行业编号') || new Map()).get(String(ind['行业编号'])) || [];
     var riskLv = indRisks.length > 0 ? indRisks[0]['风险层级'] : 'C';
 
+    /* 台账 B10：主表 `行业描述 / 典型企业 / 风险特征 / 岗位数` 四个字段
+     * 只有 GV05、GV06、TD05、TD06 这 4/170 个行业有值，其余 166 个全空。
+     * 原实现不管有没有值都把字段名渲染出来，导致导出文件里出现大量「字段名：空」的占位行；
+     * 同时这四个字段里的内容本身有价值，却没有任何页面消费它。一并解决：
+     *   ① 空值一律跳过 —— 导出不再出现空字段占位；
+     *   ② 把这四个稀疏字段纳入渲染，且「有值才显示」。
+     * 另：`岗位数` 与全量字段 `职业数量`（170/170）逐条完全相等，属冗余，
+     *     统一改用 `职业数量`，不再渲染 `岗位数`。
+     * **不去给剩下 166 个行业补内容**：知识库的价值在可核验，批量模板填充是负资产。 */
     var fields01 = ['典型经营主体形态', '必备证照资质', '常见经营规模', '订单与客户来源', '典型融资用途'];
+    var fieldsSparse = [['行业描述', '行业描述'], ['典型企业', '典型企业'], ['风险特征', '风险特征'], ['职业数量', '岗位数']];
     var fields03 = ['前景趋势判断', '毛利率区间', '净利率区间', '旺季月份', '淡季月份', '季节性资金缺口高峰', '主要经营风险', '政策与外部驱动'];
 
-    var f01Html = fields01.map(function(f) {
-      return '<div class="kv"><span class="kv-k">' + esc2(f) + '</span><span class="kv-v">' + esc2(ind[f]) + '</span></div>';
-    }).join('');
+    function kvRows(fields) {
+      var out = '';
+      fields.forEach(function (f) {
+        var name = f, label = f;
+        if (Object.prototype.toString.call(f) === '[object Array]') { name = f[0]; label = f[1]; }
+        var v = ind[name];
+        if (v === undefined || v === null || String(v).trim() === '') return;
+        out += '<div class="kv"><span class="kv-k">' + esc2(label) + '</span><span class="kv-v">' + esc2(v) + '</span></div>';
+      });
+      return out;
+    }
 
-    var f03Html = fields03.map(function(f) {
-      return '<div class="kv"><span class="kv-k">' + esc2(f) + '</span><span class="kv-v">' + esc2(ind[f]) + '</span></div>';
-    }).join('');
+    var f01Html = kvRows(fields01.concat(fieldsSparse));
+    var f03Html = kvRows(fields03);
 
     var modesHtml = indModes.slice(0, 3).map(function(m) {
       var mFields = ['细分模式', '运作方式', '盈利逻辑', '上下游与结算回款方式', '成本结构', '资金需求特点与周期', '授信关注要点'];
@@ -7164,7 +7511,7 @@ function calcRiskScore(ind) {
   else if (seasonMonths >= 4) stabilityBase = 45;
   else if (seasonMonths >= 2) stabilityBase = 38;
   else stabilityBase = 32;
-  var stableCats = ['航空航天/军工制造', '能源/矿业/石油', '政府/公共事业/非营利', '金融', '教育/培训', '医疗健庽/生物医药', '交通运输'];
+  var stableCats = ['航空航天/军工制造', '能源/矿业/石油', '政府/公共事业/非营利', '金融', '教育/培训', '医疗健康/生物医药', '交通运输'];
   var volatileCats = ['零售/电商/消费品', '生活服务/服务业', '贸易/进出口', '广告/传媒/影视/文化/体育'];
   if (stableCats.indexOf(cat) !== -1) stabilityBase = Math.min(82, stabilityBase + 8);
   else if (volatileCats.indexOf(cat) !== -1) stabilityBase = Math.max(25, stabilityBase - 7);
@@ -7182,7 +7529,7 @@ function calcRiskScore(ind) {
   else if (/规范|引导|优化/.test(policy)) scores['政策环境'] = 42;
   else if (/监管|限制|整治|管控|收紧|严管|趋严/.test(policy)) scores['政策环境'] = 30;
   else scores['政策环境'] = 45;
-  var policySupportedCats = ['航空航天/军工制造', '新能源/环保', '医疗健庽/生物医药', '教育/培训', '农林牧渔'];
+  var policySupportedCats = ['航空航天/军工制造', '新能源/环保', '医疗健康/生物医药', '教育/培训', '农林牧渔'];
   var policyRegulatedCats = ['金融', '互联网/IT/人工智能', '房地产/建筑/工程'];
   if (policySupportedCats.indexOf(cat) !== -1) scores['政策环境'] = Math.min(85, scores['政策环境'] + 8);
   else if (policyRegulatedCats.indexOf(cat) !== -1) scores['政策环境'] = Math.max(25, scores['政策环境'] - 8);
@@ -7192,7 +7539,7 @@ function calcRiskScore(ind) {
   // 5. 竞争格局 (10%)
   var highBarrierCats = ['航空航天/军工制造', '能源/矿业/石油', '金融', '电子/通信/半导体'];
   var highCompetitionCats = ['生活服务/服务业', '零售/电商/消费品', '贸易/进出口'];
-  var mediumBarrierCats = ['制造业', '医疗健庽/生物医药', '新能源/环保', '汽车/出行服务', '物流/仓储/供应链', '交通运输'];
+  var mediumBarrierCats = ['制造业', '医疗健康/生物医药', '新能源/环保', '汽车/出行服务', '物流/仓储/供应链', '交通运输'];
   if (highBarrierCats.indexOf(cat) !== -1) scores['竞争格局'] = 72;
   else if (highCompetitionCats.indexOf(cat) !== -1) scores['竞争格局'] = 28;
   else if (mediumBarrierCats.indexOf(cat) !== -1) scores['竞争格局'] = 50;
@@ -8044,15 +8391,20 @@ function calcLoan() {
   const indCode = document.getElementById('calcInd').value;
   
   const ind = DB.industries.find(i => i['行业编号'] === indCode);
-  
-  // 行业风险系数
+
+  /* 行业风险系数。行业主表里根本没有「风险等级」这个字段（已核对 industries 全部键名），
+   * 原来恒取 '中等' → 系数恒 1.0，行业下拉框选什么结果都一样。
+   * 改为从统一装配层 prof(code) 取该行业全部城市风险的均分与层级，口径与全站一致。 */
+  const _p = prof(indCode);
+  const indLv = (_p && _p.risk && _p.risk.level) ? _p.risk.level : '';
   let riskCoef = 1.0;
-  const riskLv = (ind && ind['风险等级']) || '中等';
-  if (/低风险|极低|A|B/.test(riskLv)) riskCoef = 1.2;
-  else if (/中低|C/.test(riskLv)) riskCoef = 1.1;
-  else if (/中等|中/.test(riskLv)) riskCoef = 1.0;
-  else if (/中高|较高|D/.test(riskLv)) riskCoef = 0.8;
-  else if (/高风险|极高|E/.test(riskLv)) riskCoef = 0.6;
+  if (indLv === 'A') riskCoef = 1.2;        // 低风险：上浮
+  else if (indLv === 'B') riskCoef = 1.1;   // 中低风险
+  else if (indLv === 'C') riskCoef = 1.0;   // 中高风险：不做上浮
+  else if (indLv === 'D') riskCoef = 0.8;   // 高风险：下调 20%
+  const riskLv = indLv
+    ? indLv + ' ' + ((typeof XWK_TAXO !== 'undefined') ? XWK_TAXO.riskMeta(indLv).label : '')
+    : (ind ? '未分级' : '未选行业');
   
   // 城市系数
   let cityCoef = 1.0;
@@ -8067,12 +8419,28 @@ function calcLoan() {
   else if (years >= 0.5) yearsCoef = 0.8;
   
   const netIncome = income - debt;
-  const yearlyNet = netIncome * 12;
-  const maxLoan = Math.round(yearlyNet * riskCoef * cityCoef * yearsCoef);
-  const minLoan = Math.round(maxLoan * 0.6);
   const dti = income > 0 ? Math.round(debt / income * 100) : 0;
-  
+
   const result = document.getElementById('calcResult');
+
+  /* 月负债 ≥ 月收入时没有可贷空间。旧逻辑直接进乘法，会算出 -3.6 ~ -6.0 万这种负数额度，
+   * 属于会误导一线的话术级错误，必须显式给出结论。 */
+  if (netIncome <= 0) {
+    result.innerHTML = `
+      <h3 style="margin:0 0 16px;color:#0f172a;">测算结果</h3>
+      <div style="text-align:center;padding:24px 20px;background:#fef2f2;border:1px solid #fecaca;border-radius:8px;color:#991b1b;margin-bottom:16px;">
+        <div style="font-size:32px;font-weight:700;">0 元</div>
+        <div style="font-size:14px;font-weight:600;margin-top:8px;">无可贷空间</div>
+        <div style="font-size:12px;opacity:.85;margin-top:6px;">
+          月负债 ${debt.toLocaleString()} 元 ≥ 月收入 ${income.toLocaleString()} 元${dti ? '（负债收入比 ' + dti + '%）' : ''}，无剩余现金流可用于还款
+        </div>
+      </div>`;
+    return;
+  }
+
+  const yearlyNet = netIncome * 12;
+  const maxLoan = Math.max(0, Math.round(yearlyNet * riskCoef * cityCoef * yearsCoef));
+  const minLoan = Math.round(maxLoan * 0.6);
   result.innerHTML = `
     <h3 style="margin:0 0 16px;color:#0f172a;">测算结果</h3>
     <div style="text-align:center;padding:20px 0;background:linear-gradient(135deg,#3b82f6,#8b5cf6);border-radius:8px;color:#fff;margin-bottom:16px;">
@@ -8125,44 +8493,60 @@ function pageCityRank() {
   const cities = DB.cities || [];
   const risks = DB.city_risks || [];
   
+  /* 风险维度先按城市聚合。旧写法在 risks 数组里 break 出「第一条」，
+   * 而 city_risks 是按行业编号排序的，第一条永远是 AE01 航空器制造 ——
+   * 等于 23 个城市全部用同一个行业定级（宁波被判 C，按该城 166 条均分 47.7 应为 B）。 */
+  const riskAgg = {};
+  risks.forEach(function (r) {
+    const n = r['城市']; if (!n) return;
+    const sc = Number(r['风险评分']);
+    if (!riskAgg[n]) riskAgg[n] = { sum: 0, n: 0 };
+    if (isFinite(sc)) { riskAgg[n].sum += sc; riskAgg[n].n++; }
+  });
+
   // 计算综合吸引力得分
   const ranked = cities.map(city => {
     const name = city['城市名称'] || city.name || String(city);
-    const salaryCoef = parseFloat(city['薪资系数']) || 0.7;
-    const ecoLevel = parseFloat(city['经济水平']) || 6;
-    
-    // 找风险数据（用for循环避免箭头函数问题）
-    let risk = null;
-    for (let k = 0; k < risks.length; k++) {
-      if (risks[k]['城市'] === name) { risk = risks[k]; break; }
-    }
-    
-    let riskScore = 50;
-    let riskLv = 'C';
-    if (risk) {
-      try {
-        riskLv = normLv(risk['风险层级']) || 'C';
-        riskScore = 80 - (riskLv === 'A' ? 10 : riskLv === 'B' ? 25 : riskLv === 'C' ? 45 : 65);
-      } catch(e) { riskScore = 50; }
-    }
-    
+    const cf = city['城市系数'] || {};
+    // 字段核对过：城市主表同时带 薪资系数/经济水平 与 城市系数.*，两者互为兜底
+    const salaryCoef = parseFloat(city['薪资系数'] || cf.salary_factor) || 0.7;
+    const ecoLevel = parseFloat(city['经济水平'] || cf.economic_level) || 6;
+
+    const ag = riskAgg[name];
+    const avgScore = (ag && ag.n) ? (ag.sum / ag.n) : null;
+    const riskLv = (avgScore === null)
+      ? ''
+      : ((typeof XWK_TAXO !== 'undefined') ? XWK_TAXO.riskLevelOf(avgScore) : '');
+    // 风险越高越不具吸引力：评分区间 0-100（越高越危险），反向映射成吸引力分
+    const riskScore = (avgScore === null) ? 50 : Math.max(0, Math.min(100, 100 - avgScore));
+
     // 综合得分：经济水平(40%) + 薪资水平(30%) + 风险可控性(30%)
     const score = Math.round(ecoLevel * 4 + salaryCoef * 30 + riskScore * 0.3);
-    
+
+    /* 样本不足的城市（福州/济南/沈阳 各仅 4 条，占全量 2.4%）不参与排名：
+     * 拿 4 条记录的均分与 170 条记录的均分同榜比较，会给出不可比甚至误导的结论。 */
+    const cov = (DB.cityRiskCoverage && DB.cityRiskCoverage[name]) ? DB.cityRiskCoverage[name] : null;
     return {
       name: name,
       tag: city['定位标签'] || '',
       salaryCoef: salaryCoef,
       ecoLevel: ecoLevel,
       riskLevel: riskLv,
+      riskScore: (avgScore === null) ? null : Math.round(avgScore * 10) / 10,
+      riskCovered: (ag && ag.n) ? ag.n : 0,
+      covFull: cov ? cov.full : 0,
+      thin: cov ? cov.thin : false,
       score: score,
     };
   }).sort((a, b) => b.score - a.score);
+
+  const rankedMain = ranked.filter(c => !c.thin);
+  const rankedThin = ranked.filter(c => c.thin);
   
   let html = `<div class="page-head">
     <div>
       <div class="page-title">城市投资吸引力排名</div>
-      <div class="page-sub">${cities.length}个城市综合吸引力排名 · 经济+薪资+风险三维度</div>
+      <div class="page-sub">${rankedMain.length}个城市参与排名 · 经济+薪资+风险三维度${rankedThin.length ? '（另有 ' + rankedThin.length + ' 城样本不足，已单列）' : ''}</div>
     </div>
   </div>`;
   
@@ -8173,7 +8557,7 @@ function pageCityRank() {
     { icon: '🥈', color: '#94a3b8', bg: '#f8fafc' },
     { icon: '🥉', color: '#ea580c', bg: '#fff7ed' },
   ];
-  ranked.slice(0, 3).forEach((c, i) => {
+  rankedMain.slice(0, 3).forEach((c, i) => {
     html += `<div style="background:${medals[i].bg};border-radius:12px;padding:20px;text-align:center;border:2px solid ${medals[i].color}22;">
       <div style="font-size:36px;">${medals[i].icon}</div>
       <div style="font-size:20px;font-weight:700;color:#0f172a;margin-top:4px;">${esc(c.name)}</div>
@@ -8187,9 +8571,9 @@ function pageCityRank() {
   // 完整排名表
   html += '<div class="section-card"><div class="section-title">📊 完整排名</div>';
   html += '<div style="overflow-x:auto;"><table class="data-table rank-table">';
-  html += '<thead><tr><th style="width:60px;">排名</th><th>城市</th><th style="width:120px;">定位标签</th><th style="width:90px;text-align:center;">经济水平</th><th style="width:90px;text-align:center;">薪资系数</th><th style="width:80px;text-align:center;">风险等级</th><th style="width:100px;text-align:center;">综合得分</th></tr></thead><tbody>';
+  html += '<thead><tr><th style="width:60px;">排名</th><th>城市</th><th style="width:120px;">定位标签</th><th style="width:90px;text-align:center;">经济水平</th><th style="width:90px;text-align:center;">薪资系数</th><th style="width:80px;text-align:center;">风险等级</th><th style="width:90px;text-align:center;">样本</th><th style="width:100px;text-align:center;">综合得分</th></tr></thead><tbody>';
   
-  ranked.forEach((c, i) => {
+  rankedMain.forEach((c, i) => {
     const rankBadge = i < 3 
       ? `<span class="rank-badge rank-${i+1}">${i+1}</span>` 
       : `<span class="rank-badge rank-normal">${i+1}</span>`;
@@ -8201,11 +8585,23 @@ function pageCityRank() {
       <td><span class="tag sm" style="background:#f1f5f9;color:#334155;">${esc(c.tag || '—')}</span></td>
       <td style="text-align:center;"><b>${c.ecoLevel}</b> <span style="font-size:11px;color:#94a3b8;">/ 10</span></td>
       <td style="text-align:center;"><b>${c.salaryCoef}</b></td>
-      <td style="text-align:center;"><span class="lv-tag" style="background:${riskColor}15;color:${riskColor};">${c.riskLevel}级</span></td>
+      <td style="text-align:center;"><span class="lv-tag" style="background:${riskColor}15;color:${riskColor};">${c.riskLevel ? c.riskLevel + '级' : '—'}</span></td>
+      <td style="text-align:center;font-size:12px;color:#64748b;">${c.riskCovered}<span style="color:#cbd5e1;">/${c.covFull}</span></td>
       <td style="text-align:center;"><b style="font-size:15px;color:var(--c-brand);">${c.score}</b></td>
     </tr>`;
   });
-  html += '</tbody></table></div></div>';
+  html += '</tbody></table></div>';
+
+  // 样本不足的城市单列，明确告知不可比
+  if (rankedThin.length) {
+    html += '<div style="margin-top:14px;padding:12px 14px;background:#fffbeb;border-left:3px solid #f59e0b;border-radius:6px;">' +
+      '<div style="font-weight:600;color:#92400e;margin-bottom:6px;">⚠ 以下 ' + rankedThin.length + ' 个城市样本不足，未纳入排名</div>' +
+      '<div style="font-size:12.5px;color:#78350f;line-height:1.8;">' +
+      rankedThin.map(c => esc(c.name) + '（' + c.riskCovered + '/' + c.covFull + ' 个行业）').join('、') +
+      '<br>城市风险矩阵对这些城市仅生成了个位数记录，用其均分与满覆盖城市同榜比较会得出不可比的结论。' +
+      '城市画像与调研层仍是完整的，选址判断请以城市分析页为准。</div></div>';
+  }
+  html += '</div>';
   
   // 评分说明
   html += `<div class="section-card">
@@ -8358,6 +8754,15 @@ function showVersionLog() {
   const typeMap = { new: { icon: '✨', label: '新增', color: '#10b981' }, opt: { icon: '⚡', label: '优化', color: '#3b82f6' }, fix: { icon: '🐛', label: '修复', color: '#f59e0b' } };
   
   let html = '';
+  /* 台账 B11（版本漂移）：更新日志停在 V12.5，而数据分片里的真实版本已是 V15.0。
+     这里不编造缺失的版本历史，而是如实标注差异 —— 当前版本一律以数据分片为准。 */
+  const dataVer = (DB.meta && DB.meta.version) || APP_VERSION;
+  const logTop = (VERSION_LOG[0] && VERSION_LOG[0].version) || '';
+  html += `<div style="margin-bottom:16px;padding:10px 12px;background:#f0fdf4;border-left:3px solid #059669;border-radius:6px;font-size:12.5px;color:#065f46;line-height:1.7;">
+    当前数据版本：<b>${esc(dataVer)}</b>${(logTop && logTop !== dataVer)
+      ? '<br>更新日志最新登记到 <b>' + esc(logTop) + '</b>，其后的变更尚未登记（以数据版本为准）'
+      : ''}</div>`;
+
   VERSION_LOG.forEach(v => {
     html += `<div style="margin-bottom:20px;">
       <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:10px;">
@@ -8571,6 +8976,82 @@ function renderRadarChart(labels, dataList) {
 
 
 // ---- 笔记功能
+/* 台账 A10：原实现只有一个编辑器 showNoteEditor，全站零调用入口 ——
+ * 用户既打不开编辑器，也看不到已保存的内容，等于"只写不读"且根本写不进去。
+ * 这里补上闭环：列出已存笔记 → 可查看/编辑/删除 → 可新建。 */
+function noteList() {
+  const P = 'xwk_notes_';
+  const out = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || k.indexOf(P) !== 0) continue;
+      let v = '';
+      try { v = JSON.parse(localStorage.getItem(k) || '""'); } catch (e) { v = localStorage.getItem(k) || ''; }
+      if (v === '' || v === null || v === undefined) continue;
+      const raw = k.slice(P.length);
+      const p = raw.indexOf('_');
+      out.push({ key: raw, type: p > 0 ? raw.slice(0, p) : '自定义', id: p > 0 ? raw.slice(p + 1) : raw, text: String(v) });
+    }
+  } catch (e) {}
+  return out.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+function showNoteList() {
+  const list = noteList();
+  const modal = document.createElement('div');
+  modal.className = 'modal-mask';
+  modal.id = 'noteListModal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:1000;';
+  const rows = list.length
+    ? list.map(n => `<div style="border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;margin-bottom:8px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+          <b style="font-size:13px;">${esc(n.type)} · ${esc(n.id)}</b>
+          <span style="white-space:nowrap;">
+            <button class="btn xs" data-note-edit="${esc(n.key)}">编辑</button>
+            <button class="btn xs" data-note-del="${esc(n.key)}" style="margin-left:6px;">删除</button>
+          </span>
+        </div>
+        <div style="font-size:12.5px;color:#475569;margin-top:6px;white-space:pre-wrap;">${esc(n.text)}</div>
+      </div>`).join('')
+    : '<p class="hint" style="margin:0">还没有笔记。点下方「新建笔记」保存一条。</p>';
+  modal.innerHTML = `<div style="background:#fff;border-radius:12px;padding:20px;width:560px;max-width:92vw;max-height:80vh;overflow:auto;">
+    <h3 style="margin:0 0 12px;">📝 我的笔记（${list.length}）</h3>
+    ${rows}
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;">
+      <button class="btn" id="noteNewBtn">＋ 新建笔记</button>
+      <button class="btn btn-primary" id="noteCloseBtn">关闭</button>
+    </div>
+  </div>`;
+  document.body.appendChild(modal);
+  modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
+  document.getElementById('noteCloseBtn').onclick = () => modal.remove();
+  document.getElementById('noteNewBtn').onclick = () => {
+    const name = (window.prompt('笔记对象名称（如：AE01 航空器制造 / 重庆火锅）') || '').trim();
+    if (!name) return;
+    modal.remove();
+    showNoteEditor('自定义', name, name);
+  };
+  modal.querySelectorAll('[data-note-edit]').forEach(b => {
+    b.onclick = () => {
+      const k = b.getAttribute('data-note-edit');
+      const n = list.find(x => x.key === k);
+      modal.remove();
+      showNoteEditor(n ? n.type : '自定义', n ? n.id : k, (n ? n.type + ' · ' + n.id : k));
+    };
+  });
+  modal.querySelectorAll('[data-note-del]').forEach(b => {
+    b.onclick = () => {
+      const k = b.getAttribute('data-note-del');
+      if (!window.confirm('删除这条笔记？')) return;
+      Storage.remove('notes_' + k);
+      modal.remove();
+      showNoteList();
+      toast('笔记已删除');
+    };
+  });
+}
+
 function showNoteEditor(targetType, targetId, targetName) {
   const key = targetType + '_' + targetId;
   const existing = Storage.get('notes_' + key, '');
@@ -8594,12 +9075,16 @@ function showNoteEditor(targetType, targetId, targetName) {
     Storage.set('notes_' + key, text);
     modal.remove();
     toast('笔记已保存');
+    // 保存后回到列表，让用户立刻看到结果（台账 A10：原来保存完就再也找不到了）
+    showNoteList();
   };
 }
 
 
 // ---- P1 数据修复：薪资补全、城市统一、趋势修复、元数据更新
-(function fixData() {
+/* 台账 A8：原为顶层 IIFE，在登录前执行，此时 DB 全空 → 整段从未生效（死代码）。
+   改为具名函数，由 buildDBFromParts() 在装配完成后调用。 */
+function fixData() {
   // 1. 趋势数据修复：从 annual 生成缺失的 trend
   for (const key in DB.salary) {
     const s = DB.salary[key];
@@ -8613,8 +9098,9 @@ function showNoteEditor(targetType, targetId, targetName) {
   
   // 2. 元数据更新（同时修正驼峰和下划线两套命名，确保所有页面显示正确）
   if (DB.meta) {
-    // 版本号由代码统一锁定为 APP_VERSION，避免不同数据分片里的旧版本号互相打架
-    DB.meta.version = APP_VERSION;
+    /* 版本号以数据分片里的真实值为准（当前为 V15.0）；
+       代码侧 APP_VERSION 只作兜底，避免把正确版本反向覆盖成旧值。 */
+    if (!DB.meta.version) DB.meta.version = APP_VERSION;
     DB.meta.updateDate = DB.meta.updateDate || new Date().toISOString().split('T')[0];
     // 驼峰命名
     DB.meta.industryCount = DB.industries.length;
@@ -8641,7 +9127,7 @@ function showNoteEditor(targetType, targetId, targetName) {
     seenCodes.add(code);
     return true;
   });
-})();
+}
 
 
 // ---- 主题按钮 & 初始化
@@ -8656,6 +9142,16 @@ function showNoteEditor(targetType, targetId, targetName) {
     btn.onclick = toggleTheme;
     btn.textContent = S.theme === 'dark' ? '☀️ 亮色' : '🌙 暗色';
     header.appendChild(btn);
+
+    // 笔记入口（台账 A10）：原实现没有任何入口可以打开笔记
+    const noteBtn = document.createElement('button');
+    noteBtn.id = 'noteListBtn';
+    noteBtn.className = 'btn';
+    noteBtn.style.cssText = 'padding:6px 12px;font-size:13px;';
+    noteBtn.onclick = showNoteList;
+    const n = noteList().length;
+    noteBtn.textContent = n ? ('📝 笔记 ' + n) : '📝 笔记';
+    header.appendChild(noteBtn);
   }
   
   // 应用主题

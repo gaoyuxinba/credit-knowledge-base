@@ -20,10 +20,27 @@ window.XWK_ENGINE = (function () {
   function fmt(v, unit) {
     if (v === null || v === undefined || isNaN(v)) return '—';
     var u = unit || '';
-    if (/元|万|营收|额/.test(u) && Math.abs(v) >= 10000) return (v / 10000).toFixed(1) + ' 万' + (/元/.test(u) ? '元' : '');
+    /* 台账 B16：做「万」换算时不能把单位的后半段吞掉。
+     * 原来是 `"…万元"`，于是 unit='元/工位' 的 40000 显示成「4.0 万元」，/工位 没了 ——
+     * 而「每工位多少钱」恰恰是这条钩子的全部含义（同理还有 元/人月、元/辆）。
+     * 现在只对**以「元」开头**的单位换算，并把后半段原样拼回：「4.0 万元/工位」；
+     * 「万元/人/月」这类已经自带「万」的，原样显示，不重复换算。 */
+    if (/^元/.test(u) && Math.abs(v) >= 10000) return (v / 10000).toFixed(1) + ' 万元' + u.slice(1);
     return Number(v).toLocaleString('zh-CN', { maximumFractionDigits: 2 }) + (u ? ' ' + u : '');
   }
   function pct(v, d) { return (v === null || v === undefined || isNaN(v)) ? '—' : (v * 100).toFixed(d === undefined ? 1 : d) + '%'; }
+
+  /* 台账 B13：比率型阈值的「按单位渲染」。
+   * 单位的取值只有三类才是真正 0~1 的百分率：
+   *   ① 没写单位（房租占比、客户集中度这类天然占比）② 单位就是 '%' ③ 单位写作「比例」
+   * 其余带真实单位的（天/月/倍/元/㎡…）直接套 pct() 会 ×100 再加 %：
+   *   ok=90（天）→ 显示「≤9000%」；ok=1（人/架）→ 显示「≤100%」。
+   * 后者尤其危险：看着完全是合理的百分率，实际含义是「每架配几个人」，方向还会被读反。
+   * 现网 600 个 ratio 钩子里 222 个带真实单位，波及 112/151 个行业。
+   * 这里只决定"怎么显示"，okT/warnT 与判定分支一概不动，历史红绿灯不会翻转。 */
+  var PCT_UNITS = { '': 1, '%': 1, '比例': 1 };
+  function isPctUnit(u) { return !!PCT_UNITS[u === undefined || u === null ? '' : String(u)]; }
+  function ratioFmt(v, unit, d) { return isPctUnit(unit) ? pct(v, d) : fmt(v, unit); }
 
   /* 只允许这些内联助手（不含 Math 等全局对象），避免表达式逃出沙箱 */
   var HELPERS = {
@@ -120,7 +137,11 @@ window.XWK_ENGINE = (function () {
         /* 比率型：expr 算出比率（如 房租/营收、净利/月供） */
         var v = calc;
         var higherBetter = h.方向 === '越高越好';
-        var okT = th.ok, warnT = th.warn;
+        /* 阈值兜底：现网 1107 个钩子里 ratio 型都带 ok+warn，但一旦数据漂移只给 ok，
+         * 原来 `v < undefined` 恒 false，会静默永不报警。这里给一个合理默认值。 */
+        var okT = (typeof th.ok === 'number') ? th.ok : 0.20;
+        var warnT = (typeof th.warn === 'number') ? th.warn
+          : (higherBetter ? okT * 0.8 : okT * 1.5);
         /* 比率型是"绝对水平 vs 阈值"，不是"自述 vs 推算"，
          * 因此不产出 dev —— 否则会把健康的低房租占比误算成"自述偏低"，污染方向冲突判定 */
         if (higherBetter) {
@@ -129,15 +150,22 @@ window.XWK_ENGINE = (function () {
           row.level = v > warnT ? 'danger' : v > okT ? 'warn' : 'ok';
         }
         row.dev = null;
-        row.calc = '阈值：正常 ≤' + pct(okT, 0) + '，危险 >' + pct(warnT, 0) + (higherBetter ? '（越高越好）' : '');
-        row.actual = pct(v) + (h.实际说明 ? '（' + h.实际说明 + '）' : '');
+        /* ---- 台账 B14：「越高越好」的钩子，比较符号必须反过来 ----
+         * 原来无论方向都写「正常 ≤okT，危险 >warnT」，但 higherBetter 的判定是
+         *   v >= okT 正常 / warnT <= v < okT 关注 / v < warnT 危险（okT > warnT）
+         * 于是 DSCR 覆盖倍数（AG05 H9：ok=1.2 warn=1）被标成「危险 >1」，方向反着读。
+         * 现网 104 个这样的钩子、波及 72/151 个行业。只改显示，判定分支不动。 */
+        row.calc = higherBetter
+          ? '阈值：正常 ≥' + ratioFmt(okT, unit, 0) + '，危险 <' + ratioFmt(warnT, unit, 0) + '（越高越好）'
+          : '阈值：正常 ≤' + ratioFmt(okT, unit, 0) + '，危险 >' + ratioFmt(warnT, unit, 0);
+        row.actual = ratioFmt(v, unit) + (h.实际说明 ? '（' + h.实际说明 + '）' : '');
         row.advice = row.level === 'danger' ? (adv.高 || '') : row.level === 'warn' ? (adv.中 || adv.高 || '') : (adv.正常 || '');
       } else if (mode === 'floor') {
         /* 底线型：expr 算出底线（如保本营收），看实际站不站得住 */
         if (actual === null || isNaN(actual)) {
           row.advice = '未填自述值，无法比对底线';
         } else {
-          var margin = th.ok || 1.2;
+          var margin = (typeof th.ok === 'number' && th.ok > 0) ? th.ok : 1.2;
           row.level = actual < calc ? 'danger' : actual < calc * margin ? 'warn' : 'ok';
           row.dev = (actual - calc) / calc;
           row.advice = row.level === 'danger' ? (adv.低 || '') : row.level === 'warn' ? (adv.中 || '') : (adv.正常 || '');
@@ -150,8 +178,12 @@ window.XWK_ENGINE = (function () {
         } else {
           var d = (actual - calc) / calc;
           var a = Math.abs(d);
+          /* 同上：th.warn 缺失时 `a <= undefined` 恒 false，会一律判红灯。
+           * 默认 warn = ok × 2（与引擎默认阈值对 ok:0.20 / warn:0.40 同比例）。 */
+          var okD = (typeof th.ok === 'number') ? th.ok : 0.20;
+          var warnD = (typeof th.warn === 'number') ? th.warn : okD * 2;
           row.dev = d;
-          row.level = a <= th.ok ? 'ok' : a <= th.warn ? 'warn' : 'danger';
+          row.level = a <= okD ? 'ok' : a <= warnD ? 'warn' : 'danger';
           row.advice = d > 0 ? (row.level === 'ok' ? (adv.正常 || '') : (adv.高 || ''))
                              : (row.level === 'ok' ? (adv.正常 || '') : (adv.低 || ''));
         }

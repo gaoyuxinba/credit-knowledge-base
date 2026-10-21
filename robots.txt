@@ -1,0 +1,5 @@
+# 台账 A15：本站为内部使用的信贷风控知识库，内容含风控规则与核验话术，
+# 不纳入搜索引擎索引。若日后希望公开收录，删除本文件与 index.html 里的
+# <meta name="robots" content="noindex..."> 一行即可。
+User-agent: *
+Disallow: /

@@ -334,7 +334,7 @@ const APP_VERSION = 'V15.1';
  *   • 数据分片的缓存标签 DATA_CACHE_TAG 由它派生（见下方 fetchShard）；
  *   • index.html 里 8 处 <script>/<link> 的 ?v= 必须与它完全一致。
  * 校验与一键同步：`node _tools/check_version.mjs`（只读校验）/ `node _tools/check_version.mjs --bump v154` */
-const XWK_BUILD = 'v153';
+const XWK_BUILD = 'v154';
 
 /* ---- H2 数据可信度标识 ----
  * 目的：让用户一眼看出哪些内容是核实过的深内容（L4/L3）、哪些是主表基础信息（L2/L1）、
@@ -1565,12 +1565,104 @@ async function gcmDecrypt(key, iv, dataWithTag, aad) {
   return new Uint8Array(plain);
 }
 
-/* 数据分片缓存标签：必须与 index.html 里的 ?v= 同步递增。
+/* ---- 台账 A21 · 数据缓存与代码缓存必须分开 ----
+ * 数据分片 27MB、几乎不变；代码几百 KB、经常改。两者的生命周期不一样，
+ * 缓存标签就不该共用 —— 上一版（B11）为了「单一来源」把它挂在 XWK_BUILD 上，
+ * 副作用是改一行 JS 也逼着用户重下 27MB，本末倒置。
+ * 所以这里独立出一个数据版本：
+ *   • 只在这批密文真的被重新生成时才 +1；
+ *   • 与代码侧的 XWK_BUILD 各管各的，check_version.mjs 会校验两者没有被串起来。 */
+const DATA_VERSION = 'v150';
+
+/* 数据分片缓存标签：只跟着 DATA_VERSION 走，**不跟代码版本走**（台账 A21）。
    台账 A11：原先用 cache:'no-store'，27MB / 11 个分片每次登录全量重下；
    改为带版本参数 + 默认缓存，二次登录可命中 304，数据变更时递增标签即强制取新。
-   台账 B11：不再手写第二个常量 —— 直接由上面的 XWK_BUILD 派生，
-   杜绝「改了 XWK_BUILD 忘了改这里」导致的缓存不同步。 */
-const DATA_CACHE_TAG = XWK_BUILD;
+   台账 A22：命中本机 IndexedDB 缓存时根本不会走到这里。 */
+const DATA_CACHE_TAG = DATA_VERSION;
+
+/* ---- 台账 A22 · 密文本机持久化（二次登录不再走网络）----
+ * 实测数据先行（_tools/measure_a22.mjs，26.05MB 全量）：
+ *   AES-GCM 解密 60ms + JSON.parse 62ms = 122ms，结构化克隆反而要 118ms。
+ *   ⇒ 首登的等待几乎全在网络传输上，本机那点 CPU 根本不值一提，
+ *     优化该做的是「把下载这一步省掉」，而不是去省解密或解析。
+ *
+ * 存什么？**存密文**——就是 static/data 里那 11 个 .enc 的原样字节。
+ *   · 这些字节本来就在公网上匿名可下载，本地留一份，安全等级零变化；
+ *   · 磁盘上永远只有密文，不存明文、不额外派生本机密钥，
+ *     也就不存在"明文落盘"这条新增的风险面；
+ *   · 比先前设想的「明文+本机密钥」方案更省事也更安全。
+ * 顺带把 GitHub Pages 的 Cache-Control: max-age=600（10 分钟就过期重校验）
+ * 这个坑一起填了 —— 本机缓存不看HTTP头，隔多久再登录都不必再问服务器。
+ *
+ * 为什么用 Cache API 而不是 IndexedDB：存的本就是字节流，无需结构化克隆，
+ * 也不像 HTTP 缓存那样受 max-age 摆布；安全上下文要求与 crypto.subtle 一致
+ * （本站已强制 HTTPS/localhost，见 unlockData 开头的环境校验）。 */
+const CACHE_STORE = 'xwk-data-' + DATA_VERSION;
+
+function dataCacheSupported() {
+  try { return !!(window.caches && typeof window.caches.open === 'function'); } catch (e) { return false; }
+}
+function cacheUrlOf(name) {
+  return new URL('static/data/' + name + '?v=' + DATA_VERSION, location.href).href;
+}
+async function dataCacheOpen() {
+  if (!dataCacheSupported()) return null;
+  try { return await caches.open(CACHE_STORE); } catch (e) { return null; }
+}
+/* 读：未命中 / 坏片一律返回 null，由调用方回退到网络 */
+async function readShardCache(name) {
+  const c = await dataCacheOpen();
+  if (!c) return null;
+  try {
+    const res = await c.match(cacheUrlOf(name));
+    if (!res || !res.ok) return null;
+    const buf = new Uint8Array(await res.arrayBuffer());
+    // 12 字节 IV + 16 字节 GCM tag + 至少 1 字节密文，短于此必是坏片
+    if (buf.length < 29) { await c.delete(cacheUrlOf(name)).catch(function () {}); return null; }
+    return buf;
+  } catch (e) { return null; }
+}
+/* 写：配额不足 / 隐私模式一律静默失败，绝不影响登录 */
+async function writeShardCache(name, bytes) {
+  const c = await dataCacheOpen();
+  if (!c) return false;
+  try {
+    await c.put(cacheUrlOf(name), new Response(bytes, {
+      headers: { 'Content-Type': 'application/octet-stream' }
+    }));
+    return true;
+  } catch (e) { return false; }
+}
+/* 数据版本一变，桶名随之变化，旧桶在这里一次性清理 */
+async function purgeStaleDataCaches() {
+  if (!dataCacheSupported()) return 0;
+  let n = 0;
+  try {
+    const keys = await caches.keys();
+    for (const k of keys) {
+      if (k.indexOf('xwk-data-') === 0 && k !== CACHE_STORE) {
+        await caches.delete(k).catch(function () {}); n++;
+      }
+    }
+  } catch (e) {}
+  return n;
+}
+/* 「清除本机数据缓存」入口：全删，退回首次登录体验 */
+async function clearDataCache() {
+  if (!dataCacheSupported()) return 0;
+  let n = 0;
+  try {
+    const keys = await caches.keys();
+    for (const k of keys) {
+      if (k.indexOf('xwk-data-') === 0) { await caches.delete(k).catch(function () {}); n++; }
+    }
+  } catch (e) {}
+  return n;
+}
+async function decryptPart(dek, idx, buf) {
+  const plain = await gcmDecrypt(dek, buf.slice(0, 12), buf.slice(12), 'data' + idx);
+  return JSON.parse(new TextDecoder().decode(plain));
+}
 
 // 单个分片下载：45s 超时 + 失败自动重试 2 次（网络抖动不必从头再来）
 async function fetchShard(name) {
@@ -1615,34 +1707,61 @@ async function unlockData(user, pass, onProgress) {
   const dekBytes = await gcmDecrypt(kek, b64ToBytes(w.iv), b64ToBytes(w.data), user);
   const dek = await crypto.subtle.importKey('raw', dekBytes, { name: 'AES-GCM' }, false, ['decrypt']);
 
-  // 2. 并发下载分片（并发 4，原实现是串行 await，26MB 全靠单连接排队）
+  // 2. 取分片：先问本机缓存（台账 A22），缺哪片才下哪片
+  await purgeStaleDataCaches();   // 数据版本已变就把旧桶清掉，纯本地动作，失败已吞
   const files = window.XWK_DATA_FILES || [1,2,3,4,5,6,7,8,9].map(i => 'data' + i + '.enc');
   const total = files.length;
   const raw = new Array(total);
-  let got = 0, bytes = 0, cursor = 0;
-  report('download', 0, total, 0);
-  const CONC = Math.min(4, total);
-  async function worker() {
-    while (cursor < total) {
-      const i = cursor++;
-      const buf = await fetchShard(files[i]);
-      raw[i] = buf;
-      bytes += buf.length;
-      got++;
-      report('download', got, total, bytes / 1048576);
-    }
-  }
-  await Promise.all(Array.from({ length: CONC }, worker));
+  const origin = new Array(total);   // 'cache' | 'net'：解密失败时要知道该不该重抓
+  const needNet = [];
+  let bytes = 0, cursor = 0;
 
-  // 3. 解密 + 解析
+  report('cache', 0, total, 0);
+  for (let i = 0; i < total; i++) {
+    const local = await readShardCache(files[i]);
+    if (local) { raw[i] = local; origin[i] = 'cache'; bytes += local.length; }
+    else needNet.push(i);
+    report('cache', i + 1, total, bytes / 1048576);
+  }
+  const hit = total - needNet.length;
+
+  if (needNet.length) {
+    report('download', hit, total, bytes / 1048576);
+    const writes = [];
+    let got = hit;
+    const CONC = Math.min(4, needNet.length);   // 并发 4，原实现是串行 await，26MB 全靠单连接排队
+    async function worker() {
+      while (cursor < needNet.length) {
+        const i = needNet[cursor++];
+        const buf = await fetchShard(files[i]);
+        raw[i] = buf;
+        origin[i] = 'net';
+        bytes += buf.length;
+        got++;
+        report('download', got, total, bytes / 1048576);
+        writes.push(writeShardCache(files[i], buf));
+      }
+    }
+    await Promise.all(Array.from({ length: CONC }, worker));
+    await Promise.all(writes);   // 等本机写入收尾，保证"下次一定命中"
+  }
+
+  // 3. 解密 + 解析（本机缓存的片若解不开，先重抓一次，不冤枉用户是密钥错了）
+  report('decrypt', 0, total, bytes / 1048576);
   const parts = {};
   for (let i = 0; i < total; i++) {
     const name = files[i];
     const idx = parseInt(String(name).replace(/\D/g, ''), 10) || (i + 1);
-    const buf = raw[i];
+    let buf = raw[i];
     raw[i] = null; // 及时释放密文，降低峰值内存
-    const plain = await gcmDecrypt(dek, buf.slice(0, 12), buf.slice(12), 'data' + idx);
-    parts[idx] = JSON.parse(new TextDecoder().decode(plain));
+    try {
+      parts[idx] = await decryptPart(dek, idx, buf);
+    } catch (e) {
+      if (origin[i] !== 'cache') throw e;   // 网络来的还错，那就是真错了（多半口令不对）
+      buf = await fetchShard(name);         // 本机这片坏了：抓新的 → 覆盖本机 → 再解一次
+      await writeShardCache(name, buf);
+      parts[idx] = await decryptPart(dek, idx, buf);
+    }
     report('decrypt', i + 1, total, bytes / 1048576);
   }
 
@@ -1828,16 +1947,18 @@ async function doLogin() {
   const onProgress = function (s) {
     if (!progBox) return;
     progBox.hidden = false;
-    // key 5% → download 5~70% → decrypt 70~95% → build 95~100%
+    // key 3% → cache 5~15% → download 15~70% → decrypt 70~95% → build 95~100%
     let ratio = 0;
-    if (s.stage === 'key') ratio = 0.05;
-    else if (s.stage === 'download') ratio = 0.05 + 0.65 * (s.done / Math.max(1, s.total));
+    if (s.stage === 'key') ratio = 0.03;
+    else if (s.stage === 'cache') ratio = 0.05 + 0.10 * (s.done / Math.max(1, s.total));
+    else if (s.stage === 'download') ratio = 0.15 + 0.55 * (s.done / Math.max(1, s.total));
     else if (s.stage === 'decrypt') ratio = 0.70 + 0.25 * (s.done / Math.max(1, s.total));
     else ratio = 0.98;
     if (progFill) progFill.style.width = (ratio * 100).toFixed(0) + '%';
     if (progTxt) {
       const mb = s.mb ? s.mb.toFixed(1) + ' MB' : '';
       if (s.stage === 'key') progTxt.textContent = '正在校验口令…';
+      else if (s.stage === 'cache') progTxt.textContent = '正在读取本机数据 ' + s.done + '/' + s.total;
       else if (s.stage === 'download') progTxt.textContent = '正在下载数据 ' + s.done + '/' + s.total + '（' + mb + '）';
       else if (s.stage === 'decrypt') progTxt.textContent = '正在解密 ' + s.done + '/' + s.total;
       else progTxt.textContent = '正在装配数据…';
@@ -1919,6 +2040,17 @@ $('#userMenu').onclick = (e) => {
 
     $('#loginPass').value = '';
 
+  }
+
+  /* 台账 A22：本机缓存的是密文，留着无害（等同公网上那份），所以登出不自动删。
+     真要腾空间 / 换电脑，由用户自己点这个按钮。 */
+  else if (e.target.dataset.act === 'clearcache') {
+    const menu = $('#userMenu'); if (menu) menu.classList.remove('show');
+    clearDataCache().then(function (n) {
+      toast('本机缓存已清除', n > 0
+        ? '已删除 ' + n + ' 份数据缓存，下次登录将重新下载（约 26MB）'
+        : '本机当前没有数据缓存', 'ok');
+    }).catch(function () { toast('清除失败', '浏览器不允许清除本站缓存', 'err'); });
   }
 
 };

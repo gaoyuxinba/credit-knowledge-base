@@ -11,7 +11,7 @@
 <meta name="robots" content="noindex, nofollow, noarchive">
 <!-- 内联 SVG favicon：避免 /favicon.ico 404，且不增加一次网络请求 -->
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231d4ed8'/%3E%3Ctext x='16' y='23' font-size='19' text-anchor='middle' fill='white'%3E%E5%8D%A1%3C/text%3E%3C/svg%3E">
-<link rel="stylesheet" href="static/style.css?v=v153">
+<link rel="stylesheet" href="static/style.css?v=v154">
 </head>
 <body>
 <noscript>
@@ -77,6 +77,7 @@
           </div>
           <div class="usermenu" id="userMenu">
             <button data-act="logout">退出登录</button>
+            <button data-act="clearcache">清除本机数据缓存</button>
           </div>
         </div>
       </div>
@@ -102,17 +103,17 @@
      导致登录按钮失效、点击后表单原生提交把密码带进 URL。已彻底移出首屏关键路径。 -->
 
 <!-- 密钥环：仅含被各账号密码包装后的密钥，不含任何业务数据 -->
-<script src="static/keyring.js?v=v153"></script>
+<script src="static/keyring.js?v=v154"></script>
 <!-- V10.0：评级与分层「单一事实来源」（须在 app.js 之前） -->
-<script src="static/core_taxonomy.js?v=v153"></script>
+<script src="static/core_taxonomy.js?v=v154"></script>
 <!-- V10.0：统一行业装配层（把行业主表/模式/岗位/薪资/城市风险/深度档案合并为一份档案） -->
-<script src="static/profile.js?v=v153"></script>
+<script src="static/profile.js?v=v154"></script>
 <!-- V10.0：通用交叉验证引擎（由行业档案自带的钩子配置驱动） -->
-<script src="static/cross_engine.js?v=v153"></script>
+<script src="static/cross_engine.js?v=v154"></script>
 <!-- V12.2：全库字段一致性体检（只读，须在 app.js 之前） -->
-<script src="static/audit.js?v=v153"></script>
-<script src="static/app.js?v=v153"></script>
+<script src="static/audit.js?v=v154"></script>
+<script src="static/app.js?v=v154"></script>
 <!-- V10.0：行业深度档案页 + 数据勾稽看板（依赖 app.js，须在其后加载） -->
-<script src="static/deep_page.js?v=v153"></script>
+<script src="static/deep_page.js?v=v154"></script>
 </body>
 </html>
